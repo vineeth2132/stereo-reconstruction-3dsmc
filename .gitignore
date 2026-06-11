@@ -1,0 +1,48 @@
+# Build folders
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.cmake
+
+# Compiled files
+*.exe
+*.out
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+.DS_Store
+
+# Python / DL later
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Large datasets
+datasets/
+data/Middlebury/
+data/KITTI/
+data/ETH3D/
+
+# Generated outputs
+results/
+outputs/
+*.ply
+*.pcd
+*.obj
+*.png
+*.jpg
+
+# Keep provided sample images
+!data/delivery_area/images/dslr_images_undistorted/*.JPG

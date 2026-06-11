@@ -1,0 +1,7 @@
+{
+  "dependencies": [
+    "opencv4",
+    "eigen3"
+  ],
+  "builtin-baseline": "432412eecac55981cf608cc12e5b4bd91768ec57"
+}
