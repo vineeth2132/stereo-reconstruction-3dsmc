@@ -46,3 +46,9 @@ outputs/
 
 # Keep provided sample images
 !data/delivery_area/images/dslr_images_undistorted/*.JPG
+
+# Ignore sample/input images
+data/delivery_area/images/
+*.JPG
+*.jpg
+*.png
