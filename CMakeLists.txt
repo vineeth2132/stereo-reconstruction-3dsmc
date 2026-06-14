@@ -16,14 +16,16 @@ set(SOURCE_FILES
     src/SparseFeatureMatcher.cpp
     src/StereoGeometryEstimator.cpp
     src/StereoRectifier.cpp
-    src/DenseStereoMatcher.cpp)
+    src/DenseStereoMatcher.cpp
+    src/DepthReconstructor.cpp)
 
 set(HEADER_FILES
     include/DataLoader.h
     include/SparseFeatureMatcher.h
     include/StereoGeometryEstimator.h
     include/StereoRectifier.h
-    include/DenseStereoMatcher.h)
+    include/DenseStereoMatcher.h
+    include/DepthReconstructor.h)
 
 add_executable(stereo_reconstruction)
 

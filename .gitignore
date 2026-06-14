@@ -35,6 +35,11 @@ data/Middlebury/
 data/KITTI/
 data/ETH3D/
 
+# ETH3D scan/pose files (large; fetched by scripts/download_eth3d.py). cameras.txt is kept.
+data/delivery_area/dslr_calibration_undistorted/images.txt
+data/delivery_area/dslr_calibration_undistorted/points3D.txt
+data/**/*.7z
+
 # Generated outputs
 results/
 outputs/
