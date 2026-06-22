@@ -52,6 +52,30 @@ void ReconstructionResult::PrintStats() const
 	}
 }
 
+void ReconstructionResult::WriteDepthMapTiff(const std::filesystem::path& outputPath) const
+{
+	if (points3D.empty()) { throw std::runtime_error("Cannot write depth map from empty reconstruction."); }
+	if (validMask.empty()) { throw std::runtime_error("Cannot write depth map without valid mask."); }
+
+	cv::Mat depthMap(points3D.size(), CV_32F, cv::Scalar(-1.0f));
+
+	for (int row = 0; row < points3D.rows; ++row)
+	{
+		for (int col = 0; col < points3D.cols; ++col)
+		{
+			if (validMask.at<unsigned char>(row, col) == 0) { continue; }
+
+			const cv::Vec3f point = points3D.at<cv::Vec3f>(row, col);
+			depthMap.at<float>(row, col) = point[2];
+		}
+	}
+
+	cv::imwrite((outputPath / "depth_float.tiff").string(), depthMap);
+	cv::imwrite((outputPath / "valid_depth_mask.tiff").string(), validMask);
+
+	std::cout << "Depth map written to " << outputPath.string() << std::endl;
+}
+
 cv::Mat DepthReconstructor::ConvertQToOpenCv(const Eigen::Matrix4d& reprojectionMatrixQ) const
 {
 	cv::Mat result(4, 4, CV_64F);

@@ -35,6 +35,7 @@ struct ReconstructionResult
 
 	void WritePointCloudPly(const std::filesystem::path& outputPath) const;
 	void WriteMeshPly(const std::filesystem::path& outputPath, float maxEdgeDepthDiff) const;
+	void WriteDepthMapTiff(const std::filesystem::path& outputPath) const;
 
 	// for debugging
 	void PrintStats() const;

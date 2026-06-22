@@ -74,7 +74,10 @@ int main()
 	DepthReconstructor depthReconstructor;
 	DepthReconstructionConfig depthConfig;
 	depthConfig.metricBaseline = 1.0; // up to scale; set to the real ETH3D baseline (m) for metric depth
+	depthConfig.maxDepth = 45.0f;
+
 	ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, sgbmResult, depthConfig);
+	reconstruction.WriteDepthMapTiff(outputDir);
 	reconstruction.PrintStats();
 
 	if (reconstruction.ValidPointCount() > 0)
