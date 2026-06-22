@@ -64,17 +64,21 @@ int main()
 	DenseMatchingResult sgbmResult = denseMatcher.ComputeDisparity(rectResult, sgbmConfig);
 	//sgbmResult.ShowDisparity();
 
+	// Write raw disparity map
+	cv::imwrite((outputDir / "disparity_float.tiff").string(), sgbmResult.rawDisparity);
+	cv::imwrite((outputDir / "valid_disparity_mask.tiff").string(), sgbmResult.validDisparityMask);
+
 	// Step output: colored disparity map.
 	cv::Mat disparityColored;
 	cv::applyColorMap(sgbmResult.disparityVisualization, disparityColored, cv::COLORMAP_JET);
 	disparityColored.setTo(cv::Scalar(0, 0, 0), ~sgbmResult.validDisparityMask);
-	cv::imwrite((outputDir / "disparity_sgbm.png").string(), disparityColored);
+	cv::imwrite((outputDir / "disparity_colored.png").string(), disparityColored);
 
 	// Final stage: disparity -> depth -> colored point cloud + mesh.
 	DepthReconstructor depthReconstructor;
 	DepthReconstructionConfig depthConfig;
 	depthConfig.metricBaseline = 1.0; // up to scale; set to the real ETH3D baseline (m) for metric depth
-	depthConfig.maxDepth = 45.0f;
+	depthConfig.maxDepth = 50.0f;
 
 	ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, sgbmResult, depthConfig);
 	reconstruction.WriteDepthMapTiff(outputDir);
@@ -82,8 +86,8 @@ int main()
 
 	if (reconstruction.ValidPointCount() > 0)
 	{
-		reconstruction.WritePointCloudPly(outputDir / "pointcloud_sgbm.ply");
-		reconstruction.WriteMeshPly(outputDir / "mesh_sgbm.ply", depthConfig.maxMeshEdgeDepthDiff);
+		reconstruction.WritePointCloudPly(outputDir / "pointcloud.ply");
+		reconstruction.WriteMeshPly(outputDir / "mesh.ply", depthConfig.maxMeshEdgeDepthDiff);
 	}
 	else
 	{
