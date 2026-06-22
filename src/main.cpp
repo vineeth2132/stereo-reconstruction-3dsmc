@@ -31,18 +31,18 @@ int main()
 	StereoGeometry geometry = geometryEstimator.EstimateGeometry(matchingResult, camIntrinsics);
 
 	/*
-		StereoSGBM/StereoBM (minDisparity >= 0) only search for matches to the left
-		in the right image, which assumes the second camera is to the RIGHT of the
-		first, i.e. the recovered baseline has t.x < 0. If t.x > 0 the loaded pair
-		is in the wrong order; swap the images (and the matched points) and recompute
-		the geometry so disparities are positive and the depth comes out correct.
+		Ensure the image order matches OpenCV StereoBM/SGBM's positive-disparity
+		convention. If the recovered baseline points the wrong way (t.x > 0),
+		swap the pair and recompute the sparse stage.
 	*/
 	if (geometry.translation.x() > 0.0)
 	{
 		std::cout << "Recovered t.x > 0; swapping left/right to satisfy the disparity convention." << std::endl;
 		std::swap(imagePair.leftImage, imagePair.rightImage);
 		std::swap(imagePair.leftImgPath, imagePair.rightImgPath);
-		std::swap(matchingResult.leftMatchedPoints, matchingResult.rightMatchedPoints);
+
+		featureSet = featureMatcher.DetectFeatures(imagePair);
+		matchingResult = featureMatcher.MatchFeatures(featureSet, ratioThreshold);
 		geometry = geometryEstimator.EstimateGeometry(matchingResult, camIntrinsics);
 	}
 
