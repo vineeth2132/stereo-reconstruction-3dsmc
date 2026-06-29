@@ -12,7 +12,15 @@ The current pipeline performs:
 6. Essential matrix computation
 7. Relative camera pose recovery
 8. Stereo rectification
-9. Dense disparity-map generation with StereoBM or StereoSGBM
+9. Dense disparity-map generation with StereoBM or StereoSGBM, optionally refined
+   with an edge-aware WLS filter (`opencv_contrib` ximgproc) and a median + WLS
+   confidence post-filter
+10. Depth reconstruction: disparity → 3D points via the rectification `Q` matrix
+11. Colored point-cloud export (`.ply`)
+12. Triangle-mesh export (`.ply`) from the disparity grid, with depth-discontinuity culling
+
+Each stage also writes a step output to the `out/` directory (see [Outputs](#outputs))
+so the pipeline can be inspected without the blocking `imshow` debug windows.
 
 ## Requirements
 
@@ -33,6 +41,17 @@ The required libraries are listed in `vcpkg.json`:
 }
 ```
 
+The WLS disparity filter additionally needs the `ximgproc` module from
+`opencv_contrib`. Install OpenCV with the `contrib` feature to enable it:
+
+```powershell
+vcpkg install "opencv4[contrib]:x64-windows" --recurse
+```
+
+This is optional — without it the project still builds, falling back to
+unfiltered SGBM (CMake reports which path is active). The `useWlsFilter` flag in
+`DenseStereoConfig` is ignored when the module is absent.
+
 ## Project Structure
 
 ```text
@@ -41,20 +60,26 @@ stereo-reconstruction/
 ├── vcpkg.json
 ├── include/
 ├── src/
-├── data/
-├── out/
-└── build/
+├── scripts/      # dataset download helper (download_eth3d.py)
+├── data/         # input images + calibration (images are git-ignored)
+├── out/          # generated step outputs (git-ignored)
+└── build/        # generated build files (git-ignored)
 ```
 
 The `build/` directory contains generated build files and should not be committed.
 
 ## Dataset
 
-The current implementation has been tested with the **ETH3D `delivery_area_undistorted` dataset**.
+The current implementation has been tested with the **ETH3D `delivery_area` (DSLR, undistorted) dataset**. ETH3D is non-rectified, which is required for this project.
 
-A small set of sample images from this dataset is included under the `data/` directory so that the pipeline can be run without downloading the full dataset.
+The image files are **not committed** (they are git-ignored); only `data/delivery_area/dslr_calibration_undistorted/cameras.txt` is tracked. Download the images with the helper script (uses the project venv, no 7-Zip needed):
 
-The currently used paths are defined in `src/main.cpp`. Update them if your local dataset structure is different.
+```powershell
+.venv\Scripts\python.exe scripts\download_eth3d.py              # images + calibration (~0.5 GB)
+.venv\Scripts\python.exe scripts\download_eth3d.py --with-depth # also ground-truth depth (for evaluation)
+```
+
+This extracts to `data/delivery_area/`, matching the paths in `src/main.cpp`. Update those paths if your local dataset structure differs.
 
 Example:
 
@@ -162,8 +187,61 @@ cd build
 cmake .. -DCMAKE_TOOLCHAIN_FILE="<VCPKG_ROOT>/scripts/buildsystems/vcpkg.cmake"
 ```
 
+## Outputs
+
+Running the executable writes the following step outputs to `out/`:
+
+| File | Description |
+|------|-------------|
+| `rectified_left.png`, `rectified_right.png` | Rectified pair — corresponding points should lie on the same rows |
+| `disparity_colored.png` | Colored disparity map (invalid pixels black) |
+| `disparity_float.tiff`, `valid_disparity_mask.tiff` | Raw disparity + mask (for MATLAB/quantitative inspection) |
+| `depth_float.tiff`, `valid_depth_mask.tiff` | Per-pixel depth (Z) + mask |
+| `pointcloud.ply` | Colored 3D point cloud |
+| `mesh.ply` | Triangle mesh from the disparity grid |
+
+The `scripts/visualize_disparity.m` / `visualize_depth.m` MATLAB helpers display
+the `.tiff` maps with a color scale.
+
+Open the `.ply` files in MeshLab or CloudCompare. `out/` is git-ignored.
+
+## Depth reconstruction (`DepthReconstructor`)
+
+`DepthReconstructor` turns the disparity map into 3D geometry:
+
+* Uses the rectification `Q` matrix (`cv::reprojectImageTo3D`) to back-project each
+  valid disparity pixel into a 3D point, colored from the rectified left image.
+* The result is **up to scale** because the recovered translation is unit-length.
+  Set `DepthReconstructionConfig::metricBaseline` to the real baseline (in meters,
+  computable from the ETH3D `images.txt` poses) for metric depth.
+* Auto-orients the cloud so depth is positive (handles left/right-swapped inputs).
+* Clips far outliers at `maxDepthPercentile` (default 98th percentile) so the mesh
+  stays viewable without a hand-tuned absolute `maxDepth`. The reconstruction is
+  only up to scale, so an absolute limit is arbitrary and drifts between runs; the
+  percentile adapts automatically. Set an explicit `maxDepth` to override.
+* Exports a colored point cloud and a triangle mesh (neighboring valid pixels are
+  triangulated; quads spanning a depth discontinuity are skipped to avoid stretched
+  faces). Poisson meshing can be added later.
+
 ## Current Notes
 
 * StereoBM and StereoSGBM are both available for disparity-map generation.
-* StereoSGBM generally provides denser disparity maps, but its parameters still need tuning.
-* The recovered translation vector currently provides direction only. Metric depth reconstruction will require a known camera baseline.
+* StereoSGBM generally provides denser disparity maps. All of its knobs
+  (`blockSize`, `p1`/`p2`, `uniquenessRatio`, `speckleWindowSize`/`speckleRange`,
+  `disp12MaxDiff`, `preFilterCap`) are exposed in `DenseStereoConfig` for tuning,
+  plus a `medianKernel` post-filter. On full 25 MP ETH3D images SGBM is slow and
+  memory-heavy; consider downscaling while iterating.
+* **WLS filtering** (`useWlsFilter`, ximgproc) runs a left+right matcher and
+  edge-aware smoothing guided by the rectified left image — the single biggest
+  noise reducer. It also fills textureless/occluded regions by extrapolation, so
+  `wlsConfidenceThreshold` (default 0.5) drops the low-confidence (guessed) pixels
+  so coverage reflects actually-matched geometry. Lower it (or set 0) for a denser
+  but partly-interpolated map; raise it for a sparser, more trustworthy one.
+* `numDisparities` (default 320) must cover the scene's disparity range; the
+  matcher prints the observed range and warns if it hits the search bound. A few
+  border pixels (the left strip with no right-image overlap) always saturate — the
+  confidence gate removes them.
+* The recovered translation vector currently provides direction only, so reconstruction is up to scale. Metric depth requires the known camera baseline (from `images.txt`).
+* **Left/right ordering:** disparity matching assumes the second camera is to the right (`t.x < 0`). `main` now checks the recovered translation and, if `t.x > 0`, swaps the pair and recomputes the geometry so disparities are correct (on `delivery_area` this raised valid-disparity coverage from ~13% to ~20%). `DepthReconstructor` also keeps a cloud-orientation safety net.
+* **Known issue to address:** `DenseStereoMatcher` calls `StereoBM::compute(right, left)` but `StereoSGBM::compute(left, right)` — the inconsistent argument order flips the disparity sign for the BM path (the SGBM path used by default is correct).
+* Per the TA, the OpenCV building blocks (8-point algorithm, rectification, dense matching, depth estimation) are to be replaced with our own custom implementations.
