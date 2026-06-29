@@ -1,5 +1,6 @@
 #include "DepthReconstructor.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <fstream>
@@ -152,6 +153,37 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 		points3D *= -1.0f; // reflect through the origin so depth becomes positive
 	}
 
+	/*
+		Decide the upper depth limit. An explicit maxDepth wins; otherwise derive
+		one from a percentile of the (sign-corrected) valid depths so far outliers
+		are dropped without a hand-tuned magic constant.
+	*/
+	float effectiveMaxDepth = config.maxDepth;
+	if (effectiveMaxDepth <= 0.0f && config.maxDepthPercentile > 0.0f && config.maxDepthPercentile < 100.0f)
+	{
+		std::vector<float> depths;
+		depths.reserve(static_cast<size_t>(finiteCount));
+		for (int row = 0; row < points3D.rows; ++row)
+		{
+			for (int col = 0; col < points3D.cols; ++col)
+			{
+				if (baseMask.at<unsigned char>(row, col) == 0) { continue; }
+				const float z = points3D.at<cv::Vec3f>(row, col)[2];
+				if (z > config.minDepth) { depths.push_back(z); }
+			}
+		}
+
+		if (!depths.empty())
+		{
+			const size_t rank = std::min(depths.size() - 1,
+				static_cast<size_t>((config.maxDepthPercentile / 100.0f) * (depths.size() - 1)));
+			std::nth_element(depths.begin(), depths.begin() + rank, depths.end());
+			effectiveMaxDepth = depths[rank];
+			std::cout << "Depth clip: keeping Z <= " << effectiveMaxDepth << " ("
+				<< config.maxDepthPercentile << "th percentile of " << depths.size() << " valid depths)." << std::endl;
+		}
+	}
+
 	ReconstructionResult result;
 	result.points3D = points3D;
 	result.colors = rectificationResult.rectifiedLeftImage; // BGR, already aligned to the disparity map
@@ -165,7 +197,7 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 
 			const float z = points3D.at<cv::Vec3f>(row, col)[2];
 			if (z <= config.minDepth) { continue; }
-			if (config.maxDepth > 0.0f && z > config.maxDepth) { continue; }
+			if (effectiveMaxDepth > 0.0f && z > effectiveMaxDepth) { continue; }
 
 			result.validMask.at<unsigned char>(row, col) = 255;
 		}

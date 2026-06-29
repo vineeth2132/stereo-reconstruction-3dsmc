@@ -18,7 +18,16 @@ struct DepthReconstructionConfig
 
 	// Depth gating in the same units as the reconstruction (after scaling).
 	float minDepth = 0.0f;
-	float maxDepth = 0.0f; // 0 disables the upper limit
+	float maxDepth = 0.0f; // explicit upper limit; 0 -> derive from maxDepthPercentile
+
+	/*
+		The reconstruction is only up to scale, so an absolute maxDepth is an
+		arbitrary magic number that drifts whenever the geometry/scale changes.
+		When maxDepth is 0, clip everything above this percentile of the valid
+		depths instead - a scene-adaptive way to drop far outliers that keeps the
+		mesh viewable without hand-tuning. Set to 0 to disable clipping entirely.
+	*/
+	float maxDepthPercentile = 98.0f;
 
 	// Mesh: skip triangles whose vertices differ in depth by more than this
 	// (suppresses stretched faces across occlusion/depth boundaries).

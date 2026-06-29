@@ -78,7 +78,8 @@ int main()
 	DepthReconstructor depthReconstructor;
 	DepthReconstructionConfig depthConfig;
 	depthConfig.metricBaseline = 1.0; // up to scale; set to the real ETH3D baseline (m) for metric depth
-	depthConfig.maxDepth = 50.0f;
+	// maxDepth left at 0: DepthReconstructor clips far outliers at maxDepthPercentile
+	// (scene-adaptive). Set depthConfig.maxDepth explicitly to override.
 
 	ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, sgbmResult, depthConfig);
 	reconstruction.WriteDepthMapTiff(outputDir);
