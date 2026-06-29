@@ -37,6 +37,7 @@ public:
 
 	StereoImagePair LoadStereoPair(const std::filesystem::path& leftImgRelativePath, const std::filesystem::path& rightImgRelativePath);
 	CameraIntrinsics LoadCameraIntrinsics(const std::filesystem::path& cameraFileRelativePath);
+	float LoadMetricBaselineFromImagesTxt(const std::string& imagesTxtRelativePath, const std::string& leftImgName, const std::string& rightImgName);
 
 private:
 	cv::Mat LoadImage(const std::filesystem::path& imgPath);

@@ -77,7 +77,8 @@ int main()
 	// Final stage: disparity -> depth -> colored point cloud + mesh.
 	DepthReconstructor depthReconstructor;
 	DepthReconstructionConfig depthConfig;
-	depthConfig.metricBaseline = 1.0; // up to scale; set to the real ETH3D baseline (m) for metric depth
+	depthConfig.metricBaseline = dataLoader.LoadMetricBaselineFromImagesTxt("dslr_calibration_undistorted/images.txt", imagePair.leftImgPath.filename().string(), imagePair.rightImgPath.filename().string()); // up to scale; set to the real ETH3D baseline (m) for metric depth
+	std::cout << "Calculated Metric Baseline = " << depthConfig.metricBaseline << std::endl;
 	// maxDepth left at 0: DepthReconstructor clips far outliers at maxDepthPercentile
 	// (scene-adaptive). Set depthConfig.maxDepth explicitly to override.
 

@@ -108,3 +108,115 @@ CameraIntrinsics DataLoader::LoadCameraIntrinsics(const std::filesystem::path& c
 
 }
 
+namespace
+{
+    std::string ToLower(std::string s)
+    {
+        std::transform(s.begin(), s.end(), s.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        return s;
+    }
+
+    std::string ImageKey(const std::string& imageName)
+    {
+        // Convert paths such as:
+        //   DSC_0688.jpg
+        //   dslr_images_undistorted/DSC_0688.JPG
+        // into a common key:
+        //   dsc_0688
+        return ToLower(std::filesystem::path(imageName).stem().string());
+    }
+
+    struct ColmapImagePose
+    {
+        Eigen::Quaterniond q;
+        Eigen::Vector3d t;
+
+        Eigen::Vector3d CameraCenter() const
+        {
+            // COLMAP stores world-to-camera pose:
+            //   x_cam = R * x_world + t
+            //
+            // The camera center in world coordinates is:
+            //   C = -R^T * t
+            Eigen::Matrix3d R = q.normalized().toRotationMatrix();
+            return -R.transpose() * t;
+        }
+    };
+}
+
+float DataLoader::LoadMetricBaselineFromImagesTxt(const std::string& imagesTxtRelativePath, const std::string& leftImgName, const std::string& rightImgName)
+{
+    const std::filesystem::path imagesTxtPath = dataRootDirectory / imagesTxtRelativePath;
+    // Use the DataLoader root path and append the relative images.txt path.
+
+    std::ifstream file(imagesTxtPath);
+    if (!file.is_open())
+    {
+        throw std::runtime_error("Could not open images.txt: " + imagesTxtPath.string());
+    }
+
+    const std::string leftKey = ImageKey(leftImgName);
+    const std::string rightKey = ImageKey(rightImgName);
+
+    bool foundLeft = false;
+    bool foundRight = false;
+
+    ColmapImagePose leftPose;
+    ColmapImagePose rightPose;
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        if (line.empty() || line[0] == '#')
+            continue;
+
+        std::istringstream iss(line);
+
+        int imageId;
+        double qw, qx, qy, qz;
+        double tx, ty, tz;
+        int cameraId;
+        std::string imagePath;
+
+        if (!(iss >> imageId >> qw >> qx >> qy >> qz >> tx >> ty >> tz >> cameraId >> imagePath))
+            continue;
+
+        const std::string currentKey = ImageKey(imagePath);
+
+        if (currentKey == leftKey)
+        {
+            leftPose.q = Eigen::Quaterniond(qw, qx, qy, qz);
+            leftPose.t = Eigen::Vector3d(tx, ty, tz);
+            foundLeft = true;
+        }
+
+        if (currentKey == rightKey)
+        {
+            rightPose.q = Eigen::Quaterniond(qw, qx, qy, qz);
+            rightPose.t = Eigen::Vector3d(tx, ty, tz);
+            foundRight = true;
+        }
+
+        // In COLMAP's images.txt format, each pose line is followed by a POINTS2D line.
+        // Skip that line because it is not needed for baseline computation.
+        std::getline(file, line);
+
+        if (foundLeft && foundRight)
+            break;
+    }
+
+    if (!foundLeft)
+        throw std::runtime_error("Left image pose not found in images.txt: " + leftImgName);
+
+    if (!foundRight)
+        throw std::runtime_error("Right image pose not found in images.txt: " + rightImgName);
+
+    const Eigen::Vector3d C_left = leftPose.CameraCenter();
+    const Eigen::Vector3d C_right = rightPose.CameraCenter();
+
+    const double baseline = (C_right - C_left).norm();
+
+    return static_cast<float>(baseline);
+}
