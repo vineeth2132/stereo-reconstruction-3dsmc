@@ -86,6 +86,11 @@ int main()
 	reconstruction.WriteDepthMapTiff(outputDir);
 	reconstruction.PrintStats();
 
+	cv::Mat gtDepthRaw = dataLoader.LoadGroundTruthDepthMap("ground_truth_depth/dslr_images/DSC_0688.jpg", 6048, 4032); // 6048x4032 hardcoded, i know it's not good but the resolution of the raw images are required. -emircan
+	cv::imwrite((outputDir / "gt_depth_raw_float.tiff").string(), gtDepthRaw);
+	RawCameraCalibration rawCalibration = dataLoader.LoadRawCameraCalibration("dslr_calibration_jpg/cameras.txt");
+
+
 	if (reconstruction.ValidPointCount() > 0)
 	{
 		reconstruction.WritePointCloudPly(outputDir / "pointcloud.ply");

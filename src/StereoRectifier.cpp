@@ -114,7 +114,9 @@ RectificationResult StereoRectifier::Rectify(const StereoImagePair& imagePair, c
         rightMapY,
         cv::INTER_LINEAR);
 
-    result.reprojectionMatrixQ =ConvertToEigenMatrix4d(reprojectionMatrixQ);
+    result.reprojectionMatrixQ = ConvertToEigenMatrix4d(reprojectionMatrixQ);
+    result.leftRectificationRotation = ConvertToEigenMatrix3d(leftRectificationRotation);
+    result.leftProjectionMatrix = ConvertToEigenMatrix3x4d(leftProjectionMatrix);
 
     std::cout << "Stereo rectification finished successfully." << std::endl;
 
@@ -136,8 +138,7 @@ cv::Mat StereoRectifier::CreateZeroDistortionCoefficients() const
     return cv::Mat::zeros(1, 5, CV_64F);
 }
 
-Eigen::Matrix4d StereoRectifier::ConvertToEigenMatrix4d(
-    const cv::Mat& matrix) const
+Eigen::Matrix4d StereoRectifier::ConvertToEigenMatrix4d(const cv::Mat& matrix) const
 {
     if (matrix.rows != 4 || matrix.cols != 4)
     {
@@ -185,4 +186,34 @@ cv::Mat StereoRectifier::ConvertToOpenCvVector(const Eigen::Vector3d& vector) co
     }
 
     return result;
+}
+
+Eigen::Matrix3d StereoRectifier::ConvertToEigenMatrix3d(const cv::Mat& mat) const
+{
+    Eigen::Matrix3d eigenMat;
+
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            eigenMat(r, c) = mat.at<double>(r, c);
+        }
+    }
+
+    return eigenMat;
+}
+
+Eigen::Matrix<double, 3, 4> StereoRectifier::ConvertToEigenMatrix3x4d(const cv::Mat& mat) const
+{
+    Eigen::Matrix<double, 3, 4> eigenMat;
+
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 4; ++c)
+        {
+            eigenMat(r, c) = mat.at<double>(r, c);
+        }
+    }
+
+    return eigenMat;
 }

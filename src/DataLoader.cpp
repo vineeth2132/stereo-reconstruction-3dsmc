@@ -220,3 +220,127 @@ float DataLoader::LoadMetricBaselineFromImagesTxt(const std::string& imagesTxtRe
 
     return static_cast<float>(baseline);
 }
+
+cv::Mat DataLoader::LoadGroundTruthDepthMap(const std::string& depthRelativePath, int width, int height)
+{
+    const std::filesystem::path depthPath = dataRootDirectory / depthRelativePath;
+
+    std::ifstream file(depthPath, std::ios::binary);
+    if (!file.is_open())
+    {
+        throw std::runtime_error("Could not open ground truth depth file: " + depthPath.string());
+    }
+
+    const size_t expectedElementCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const size_t expectedByteCount = expectedElementCount * sizeof(float);
+
+    file.seekg(0, std::ios::end);
+    const size_t actualByteCount = static_cast<size_t>(file.tellg());
+    file.seekg(0, std::ios::beg);
+
+    if (actualByteCount != expectedByteCount)
+    {
+        throw std::runtime_error(
+            "Ground truth depth size mismatch. Expected " +
+            std::to_string(expectedByteCount) + " bytes, got " +
+            std::to_string(actualByteCount) + " bytes."
+        );
+    }
+
+    std::vector<float> depthData(expectedElementCount);
+
+    file.read(
+        reinterpret_cast<char*>(depthData.data()),
+        static_cast<std::streamsize>(expectedByteCount)
+    );
+
+    if (!file)
+    {
+        throw std::runtime_error("Failed to read ground truth depth file: " + depthPath.string());
+    }
+
+    for (float& depthValue : depthData)
+    {
+        // ETH3D invalid depth values are stored as infinity.
+        // Also treat non-positive values as invalid.
+        if (!std::isfinite(depthValue) || depthValue <= 0.0f)
+        {
+            depthValue = std::numeric_limits<float>::quiet_NaN();
+        }
+    }
+
+    cv::Mat depthMap(height, width, CV_32FC1, depthData.data());
+
+    // Clone because depthData will be destroyed when this function returns.
+    return depthMap.clone();
+}
+
+RawCameraCalibration DataLoader::LoadRawCameraCalibration(const std::filesystem::path& cameraFileRelativePath)
+{
+    const std::filesystem::path cameraFilePath = dataRootDirectory / cameraFileRelativePath;
+
+    std::ifstream file(cameraFilePath);
+
+    if (!file.is_open())
+    {
+        throw std::runtime_error(
+            "Failed to open raw camera calibration file: " +
+            cameraFilePath.string());
+    }
+
+    std::string line;
+
+    while (std::getline(file, line))
+    {
+        if (line.empty() || line.front() == '#')
+        {
+            continue;
+        }
+
+        std::istringstream stream(line);
+
+        int cameraId;
+        std::string cameraModel;
+
+        RawCameraCalibration calibration{};
+
+        stream >>
+            cameraId >>
+            cameraModel >>
+            calibration.imageWidth >>
+            calibration.imageHeight >>
+            calibration.fx >>
+            calibration.fy >>
+            calibration.cx >>
+            calibration.cy >>
+            calibration.k1 >>
+            calibration.k2 >>
+            calibration.p1 >>
+            calibration.p2 >>
+            calibration.k3 >>
+            calibration.k4 >>
+            calibration.sx1 >>
+            calibration.sy1;
+
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "Invalid raw camera calibration format: " +
+                cameraFilePath.string());
+        }
+
+        if (cameraModel != "THIN_PRISM_FISHEYE")
+        {
+            throw std::runtime_error(
+                "Unsupported raw camera model: " + cameraModel);
+        }
+
+        std::cout << "Raw camera calibration loaded successfully." << std::endl;
+
+        return calibration;
+    }
+
+    throw std::runtime_error(
+        "No raw camera calibration found in file: " +
+        cameraFilePath.string());
+}
