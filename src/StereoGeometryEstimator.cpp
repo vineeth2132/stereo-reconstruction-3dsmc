@@ -1,6 +1,9 @@
 #include "StereoGeometryEstimator.h"
 #include "CustomEightPoint.h"
+
 #include <cmath>
+#include <iostream>
+#include <stdexcept>
 
 namespace
 {
@@ -41,14 +44,18 @@ namespace
                 Ftx2.at<double>(1, 0) * Ftx2.at<double>(1, 0);
 
             if (denominator < 1e-12)
+            {
                 continue;
+            }
 
             totalError += numerator / denominator;
             validCount++;
         }
 
         if (validCount == 0)
+        {
             return -1.0;
+        }
 
         return totalError / validCount;
     }
@@ -88,9 +95,17 @@ void StereoGeometry::PrintData() const
 
     for (const unsigned char isInlier : inlierMask)
     {
-        if (isInlier) { ++inlierCount; }
+        if (isInlier)
+        {
+            ++inlierCount;
+        }
     }
-    const double inlierRatio = inlierMask.empty() ? 0.0 : static_cast<double>(inlierCount) / static_cast<double>(inlierMask.size());
+
+    const double inlierRatio =
+        inlierMask.empty()
+            ? 0.0
+            : static_cast<double>(inlierCount) / static_cast<double>(inlierMask.size());
+
     const Eigen::JacobiSVD<Eigen::Matrix3d> svd(essentialMatrix);
 
     std::cout << "Fundamental matrix:\n" << fundamentalMatrix << "\n\n";
@@ -104,12 +119,13 @@ void StereoGeometry::PrintData() const
     std::cout << "Inlier ratio: " << inlierRatio * 100.0 << "%\n";
 }
 
-StereoGeometry StereoGeometryEstimator::EstimateGeometry(const SparseMatchingResult& matchingResult, const CameraIntrinsics& intrinsics) const
+StereoGeometry StereoGeometryEstimator::EstimateGeometry(
+    const SparseMatchingResult& matchingResult,
+    const CameraIntrinsics& intrinsics) const
 {
     std::cout << "Stereo geometry estimation started." << std::endl;
 
     const std::vector<cv::Point2f>& leftPoints = matchingResult.leftMatchedPoints;
-
     const std::vector<cv::Point2f>& rightPoints = matchingResult.rightMatchedPoints;
 
     if (leftPoints.size() != rightPoints.size())
@@ -122,19 +138,36 @@ StereoGeometry StereoGeometryEstimator::EstimateGeometry(const SparseMatchingRes
         throw std::runtime_error("At least eight matched point pairs are required.");
     }
 
-    cv::Mat inlierMask;
-    const cv::Mat fundamentalMatrix = cv::findFundamentalMat(leftPoints, rightPoints, cv::FM_RANSAC, 1.0, 0.999, inlierMask);
+    /*
+        OpenCV fundamental matrix is still computed only for comparison.
+        The actual pipeline below uses the custom RANSAC + custom 8-point result.
+    */
+    cv::Mat openCvInlierMask;
 
-    if (fundamentalMatrix.empty())
+    const cv::Mat openCvFundamentalMatrix = cv::findFundamentalMat(
+        leftPoints,
+        rightPoints,
+        cv::FM_RANSAC,
+        1.0,
+        0.999,
+        openCvInlierMask
+    );
+
+    if (openCvFundamentalMatrix.empty())
     {
-        throw std::runtime_error("Fundamental matrix estimation failed.");
+        throw std::runtime_error("OpenCV fundamental matrix estimation failed.");
     }
 
+    /*
+        Test 1:
+        Run custom normalized 8-point using OpenCV's inliers only.
+        This checks whether the 8-point algorithm itself works on clean matches.
+    */
     const std::vector<cv::Point2f> leftInlierPoints =
-    SelectInlierPoints(leftPoints, inlierMask);
+        SelectInlierPoints(leftPoints, openCvInlierMask);
 
     const std::vector<cv::Point2f> rightInlierPoints =
-        SelectInlierPoints(rightPoints, inlierMask);
+        SelectInlierPoints(rightPoints, openCvInlierMask);
 
     if (leftInlierPoints.size() >= 8 && rightInlierPoints.size() >= 8)
     {
@@ -142,22 +175,33 @@ StereoGeometry StereoGeometryEstimator::EstimateGeometry(const SparseMatchingRes
             CustomEightPoint::EstimateFundamental(leftInlierPoints, rightInlierPoints);
 
         const double opencvSampsonError =
-            ComputeMeanSampsonError(fundamentalMatrix, leftInlierPoints, rightInlierPoints);
+            ComputeMeanSampsonError(
+                openCvFundamentalMatrix,
+                leftInlierPoints,
+                rightInlierPoints
+            );
 
         const double customSampsonError =
-            ComputeMeanSampsonError(customFundamentalMatrix, leftInlierPoints, rightInlierPoints);
+            ComputeMeanSampsonError(
+                customFundamentalMatrix,
+                leftInlierPoints,
+                rightInlierPoints
+            );
 
         std::cout << "\n===== Custom 8-Point Check =====\n";
-        std::cout << "OpenCV Fundamental Matrix:\n" << fundamentalMatrix << "\n\n";
-        std::cout << "Custom Fundamental Matrix:\n" << customFundamentalMatrix << "\n\n";
+        std::cout << "OpenCV Fundamental Matrix:\n"
+                  << openCvFundamentalMatrix << "\n\n";
+
+        std::cout << "Custom Fundamental Matrix:\n"
+                  << customFundamentalMatrix << "\n\n";
 
         std::cout << "OpenCV mean Sampson error on OpenCV inliers: "
-                << opencvSampsonError << "\n";
+                  << opencvSampsonError << "\n";
 
         std::cout << "Custom mean Sampson error on OpenCV inliers: "
-                << customSampsonError << "\n";
+                  << customSampsonError << "\n";
 
-        PrintSingularValuesOfF(fundamentalMatrix, "OpenCV F");
+        PrintSingularValuesOfF(openCvFundamentalMatrix, "OpenCV F");
         PrintSingularValuesOfF(customFundamentalMatrix, "Custom F");
 
         std::cout << "================================\n\n";
@@ -167,14 +211,76 @@ StereoGeometry StereoGeometryEstimator::EstimateGeometry(const SparseMatchingRes
         std::cout << "Not enough inliers to test custom 8-point algorithm.\n";
     }
 
+    /*
+        Test 2:
+        Run custom RANSAC + custom normalized 8-point on all raw matches.
+        This is the custom replacement for OpenCV findFundamentalMat(..., RANSAC).
+    */
+    const CustomRansacResult customRansacResult =
+        CustomEightPoint::EstimateFundamentalRansac(
+            leftPoints,
+            rightPoints,
+            2000,
+            1.0
+        );
+
+    std::cout << "\n===== Custom RANSAC + 8-Point Check =====\n";
+
+    std::cout << "OpenCV inliers: "
+              << cv::countNonZero(openCvInlierMask)
+              << " / "
+              << leftPoints.size()
+              << "\n";
+
+    std::cout << "Custom RANSAC inliers: "
+              << customRansacResult.inlierCount
+              << " / "
+              << leftPoints.size()
+              << "\n";
+
+    std::cout << "Custom RANSAC mean Sampson error: "
+              << customRansacResult.meanSampsonError
+              << "\n";
+
+    std::cout << "Custom RANSAC Fundamental Matrix:\n"
+              << customRansacResult.fundamentalMatrix
+              << "\n";
+
+    PrintSingularValuesOfF(
+        customRansacResult.fundamentalMatrix,
+        "Custom RANSAC F"
+    );
+
+    std::cout << "========================================\n\n";
+
+    /*
+        IMPORTANT:
+        From here onward, the pipeline uses the custom fundamental matrix
+        and the custom inlier mask.
+    */
+    const cv::Mat fundamentalMatrix = customRansacResult.fundamentalMatrix;
+    cv::Mat inlierMask = customRansacResult.inlierMask.clone();
+
+    std::cout << "Using CUSTOM RANSAC + CUSTOM 8-point fundamental matrix in pipeline."
+              << std::endl;
+
     const cv::Mat cameraMatrix = CreateOpenCvCameraMatrix(intrinsics);
 
-    const cv::Mat essentialMatrix = cameraMatrix.t() * fundamentalMatrix * cameraMatrix;
+    const cv::Mat essentialMatrix =
+        cameraMatrix.t() * fundamentalMatrix * cameraMatrix;
 
     cv::Mat rotation;
     cv::Mat translation;
 
-    const int recoveredPointCount = cv::recoverPose(essentialMatrix, leftPoints, rightPoints, cameraMatrix, rotation, translation, inlierMask);
+    const int recoveredPointCount = cv::recoverPose(
+        essentialMatrix,
+        leftPoints,
+        rightPoints,
+        cameraMatrix,
+        rotation,
+        translation,
+        inlierMask
+    );
 
     if (recoveredPointCount == 0)
     {
@@ -182,14 +288,12 @@ StereoGeometry StereoGeometryEstimator::EstimateGeometry(const SparseMatchingRes
     }
 
     std::vector<unsigned char> mask;
-
     mask.reserve(inlierMask.total());
 
     for (int index = 0; index < inlierMask.rows; ++index)
     {
         mask.push_back(inlierMask.at<unsigned char>(index, 0));
     }
-
 
     StereoGeometry stereoGeometry;
     stereoGeometry.fundamentalMatrix = ConvertToEigenMatrix3d(fundamentalMatrix);
@@ -203,18 +307,19 @@ StereoGeometry StereoGeometryEstimator::EstimateGeometry(const SparseMatchingRes
     return stereoGeometry;
 }
 
-
-cv::Mat StereoGeometryEstimator::CreateOpenCvCameraMatrix(const CameraIntrinsics& intrinsics) const
+cv::Mat StereoGeometryEstimator::CreateOpenCvCameraMatrix(
+    const CameraIntrinsics& intrinsics) const
 {
     return (
         cv::Mat_<double>(3, 3) <<
         intrinsics.fx, 0.0, intrinsics.cx,
         0.0, intrinsics.fy, intrinsics.cy,
         0.0, 0.0, 1.0
-        );
+    );
 }
 
-Eigen::Matrix3d StereoGeometryEstimator::ConvertToEigenMatrix3d(const cv::Mat& matrix) const
+Eigen::Matrix3d StereoGeometryEstimator::ConvertToEigenMatrix3d(
+    const cv::Mat& matrix) const
 {
     if (matrix.rows != 3 || matrix.cols != 3)
     {
@@ -237,7 +342,8 @@ Eigen::Matrix3d StereoGeometryEstimator::ConvertToEigenMatrix3d(const cv::Mat& m
     return eigenMatrix;
 }
 
-Eigen::Vector3d StereoGeometryEstimator::ConvertToEigenVector3d(const cv::Mat& vector) const
+Eigen::Vector3d StereoGeometryEstimator::ConvertToEigenVector3d(
+    const cv::Mat& vector) const
 {
     if (vector.rows != 3 || vector.cols != 1)
     {
