@@ -1,4 +1,86 @@
 #include "StereoGeometryEstimator.h"
+#include "CustomEightPoint.h"
+#include <cmath>
+
+namespace
+{
+    double ComputeMeanSampsonError(
+        const cv::Mat& F,
+        const std::vector<cv::Point2f>& points1,
+        const std::vector<cv::Point2f>& points2)
+    {
+        double totalError = 0.0;
+        int validCount = 0;
+
+        cv::Mat F64;
+        F.convertTo(F64, CV_64F);
+
+        for (size_t i = 0; i < points1.size(); ++i)
+        {
+            cv::Mat x1 = (cv::Mat_<double>(3, 1) <<
+                points1[i].x,
+                points1[i].y,
+                1.0);
+
+            cv::Mat x2 = (cv::Mat_<double>(3, 1) <<
+                points2[i].x,
+                points2[i].y,
+                1.0);
+
+            cv::Mat Fx1 = F64 * x1;
+            cv::Mat Ftx2 = F64.t() * x2;
+            cv::Mat x2tFx1 = x2.t() * F64 * x1;
+
+            const double numerator =
+                x2tFx1.at<double>(0, 0) * x2tFx1.at<double>(0, 0);
+
+            const double denominator =
+                Fx1.at<double>(0, 0) * Fx1.at<double>(0, 0) +
+                Fx1.at<double>(1, 0) * Fx1.at<double>(1, 0) +
+                Ftx2.at<double>(0, 0) * Ftx2.at<double>(0, 0) +
+                Ftx2.at<double>(1, 0) * Ftx2.at<double>(1, 0);
+
+            if (denominator < 1e-12)
+                continue;
+
+            totalError += numerator / denominator;
+            validCount++;
+        }
+
+        if (validCount == 0)
+            return -1.0;
+
+        return totalError / validCount;
+    }
+
+    std::vector<cv::Point2f> SelectInlierPoints(
+        const std::vector<cv::Point2f>& points,
+        const cv::Mat& inlierMask)
+    {
+        std::vector<cv::Point2f> inlierPoints;
+
+        for (int i = 0; i < inlierMask.rows; ++i)
+        {
+            if (inlierMask.at<unsigned char>(i, 0) != 0)
+            {
+                inlierPoints.push_back(points[static_cast<size_t>(i)]);
+            }
+        }
+
+        return inlierPoints;
+    }
+
+    void PrintSingularValuesOfF(const cv::Mat& F, const std::string& name)
+    {
+        cv::Mat F64;
+        F.convertTo(F64, CV_64F);
+
+        cv::Mat w, u, vt;
+        cv::SVD::compute(F64, w, u, vt);
+
+        std::cout << name << " singular values:\n" << w << "\n";
+    }
+}
 
 void StereoGeometry::PrintData() const
 {
@@ -46,6 +128,43 @@ StereoGeometry StereoGeometryEstimator::EstimateGeometry(const SparseMatchingRes
     if (fundamentalMatrix.empty())
     {
         throw std::runtime_error("Fundamental matrix estimation failed.");
+    }
+
+    const std::vector<cv::Point2f> leftInlierPoints =
+    SelectInlierPoints(leftPoints, inlierMask);
+
+    const std::vector<cv::Point2f> rightInlierPoints =
+        SelectInlierPoints(rightPoints, inlierMask);
+
+    if (leftInlierPoints.size() >= 8 && rightInlierPoints.size() >= 8)
+    {
+        const cv::Mat customFundamentalMatrix =
+            CustomEightPoint::EstimateFundamental(leftInlierPoints, rightInlierPoints);
+
+        const double opencvSampsonError =
+            ComputeMeanSampsonError(fundamentalMatrix, leftInlierPoints, rightInlierPoints);
+
+        const double customSampsonError =
+            ComputeMeanSampsonError(customFundamentalMatrix, leftInlierPoints, rightInlierPoints);
+
+        std::cout << "\n===== Custom 8-Point Check =====\n";
+        std::cout << "OpenCV Fundamental Matrix:\n" << fundamentalMatrix << "\n\n";
+        std::cout << "Custom Fundamental Matrix:\n" << customFundamentalMatrix << "\n\n";
+
+        std::cout << "OpenCV mean Sampson error on OpenCV inliers: "
+                << opencvSampsonError << "\n";
+
+        std::cout << "Custom mean Sampson error on OpenCV inliers: "
+                << customSampsonError << "\n";
+
+        PrintSingularValuesOfF(fundamentalMatrix, "OpenCV F");
+        PrintSingularValuesOfF(customFundamentalMatrix, "Custom F");
+
+        std::cout << "================================\n\n";
+    }
+    else
+    {
+        std::cout << "Not enough inliers to test custom 8-point algorithm.\n";
     }
 
     const cv::Mat cameraMatrix = CreateOpenCvCameraMatrix(intrinsics);
