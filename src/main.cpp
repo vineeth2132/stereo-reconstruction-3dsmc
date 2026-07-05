@@ -10,10 +10,10 @@
 
 int main()
 {
-	const std::filesystem::path outputDir = "../out";
+	const std::filesystem::path outputDir = "out";
 	std::filesystem::create_directories(outputDir);
 
-	DataLoader dataLoader("../data/delivery_area/");
+	DataLoader dataLoader("data/delivery_area/");
 	StereoImagePair imagePair = dataLoader.LoadStereoPair("images/dslr_images_undistorted/DSC_0688.jpg", "images/dslr_images_undistorted/DSC_0689.jpg");
 	//imagePair.ShowResized(0.15);
 
