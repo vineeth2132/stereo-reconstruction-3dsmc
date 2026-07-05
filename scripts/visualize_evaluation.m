@@ -40,9 +40,13 @@ scatter(xGt(1:stepGt:end), yGt(1:stepGt:end), 1, "r", "filled");
 scatter(xPred(1:stepPred:end), yPred(1:stepPred:end), 1, "b", "filled");
 scatter(xCom(1:stepCom:end), yCom(1:stepCom:end), 1, "g", "filled");
 
-title("Validity overlap: red=GT only, blue=prediction only, green=both");
-legend("GT only", "Prediction only", "Both");
-axis image;
+title("Validity overlap: red=GT only, blue=prediction only, green=both", ...
+      "FontSize", 18);
+
+lgd = legend("GT only", "Prediction only", "Both");
+lgd.FontSize = 14;
+
+set(gca, "FontSize", 14);
 
 err = abs(D_pred - D_gt);
 
@@ -58,7 +62,13 @@ scatter(x, y, 1, e, "filled");
 axis image;
 colorbar;
 colormap jet;
-title("Absolute depth error on common valid pixels");
+title("Absolute depth error on common valid pixels", ...
+      "FontSize", 18);
+
+cb = colorbar;
+cb.FontSize = 14;
+
+set(gca, "FontSize", 14);
 
 % ---------- Metrics ----------
 gtVals = D_gt(common);
