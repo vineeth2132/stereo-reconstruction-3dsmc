@@ -8,7 +8,7 @@ The current pipeline performs:
 2. Camera intrinsics loading
 3. SIFT keypoint detection
 4. Sparse feature matching with ratio filtering
-5. Fundamental matrix estimation using a custom normalized 8-point algorithm with custom RANSAC, with OpenCV kept only for comparison/debugging
+5. Fundamental matrix estimation using a custom Hartley-normalized 8-point algorithm with custom Sampson-error RANSAC (`CustomEightPoint`), with `cv::findFundamentalMat` kept only for comparison/debugging
 6. Essential matrix computation
 7. Relative camera pose recovery
 8. Stereo rectification
@@ -216,6 +216,12 @@ Running the executable writes the following step outputs to `out/`. The dense an
 | `mesh_<tag>.ply` | Triangle mesh from the disparity grid |
 | `disparity_<tag>_scaled.png`, `depth_<tag>_scaled.png` | Color-scaled map with colorbar, **white = invalid** (from `visualize_maps.py`) |
 | `comparison_disparity.png`, `comparison_depth.png` | OpenCV-vs-custom side-by-side, shared color scale (from `visualize_maps.py`) |
+| `gt_depth_raw_float.tiff`, `gt_depth_rectified_float.tiff` | ETH3D ground-truth depth (raw + rectified into the disparity frame), written only when the GT data is present |
+| `error_<tag>_scaled.png` | Absolute depth-error map vs. rectified GT, shared color scale, white = invalid (from `evaluate_depth.py`) |
+
+The dense/3D outputs are only produced in their `<tag>`ged form; the earlier
+un-tagged `mesh.ply`, `pointcloud.ply`, and `disparity_*` names are no longer
+written.
 
 Generate the scaled / comparison figures with the Python helper (after running the
 executable):
@@ -230,6 +236,35 @@ side-by-side comparison in one go.
 
 Open the `.ply` files in MeshLab or CloudCompare. `out/` is git-ignored.
 
+## Quantitative evaluation
+
+`scripts/evaluate_depth.py` scores each backend's metric depth map against the
+rectified ETH3D ground truth. For every tag it intersects our-valid with GT-valid
+and reports coverage, MAE, RMSE, median absolute error, bad-pixel ratios (at
+0.1 / 0.5 / 1.0 m), and a median-scale-aligned MAE that removes any global scale
+bias so structural error can be inspected on its own. It prints a comparison table
+and writes an absolute-error map per backend (`error_<tag>_scaled.png`).
+
+It needs the ground-truth depth downloaded (`--with-depth`) so the pipeline emits
+`gt_depth_rectified_float.tiff` (the GT block in `main` is wrapped in try/catch, so
+the pipeline still runs without it), and the same venv packages as
+`visualize_maps.py`:
+
+```powershell
+.venv\Scripts\python.exe scripts\download_eth3d.py --with-depth
+.\build\Release\stereo_reconstruction.exe
+.venv\Scripts\python.exe scripts\evaluate_depth.py
+```
+
+On `delivery_area` (metric baseline 0.4289 m recovered from `images.txt`) the custom
+depth backend beats tuned OpenCV SGBM:
+
+| Metric | OpenCV (tuned) | Custom |
+|--------|---------------:|-------:|
+| MAE | 0.079 m | **0.040 m** |
+| bad > 0.1 m | 19.4% | **8.5%** |
+| coverage | 31.5% | **35.4%** |
+
 ## Dense matching backends
 
 The dense stage is split behind the `IDenseStereoMatcher` interface, so the OpenCV
@@ -239,31 +274,49 @@ flag, `DenseStereoConfig::backend`:
 
 * `DenseStereoBackend::OpenCv` (`DenseStereoMatcher`) — OpenCV StereoBM/StereoSGBM
   with the optional WLS refinement described above.
-* `DenseStereoBackend::Custom` (`CustomDenseMatcher`) — **our own** normalized
-  cross-correlation (NCC) block matcher. It builds the cost volume, winner-take-all
-  disparity, parabola subpixel refinement, a left-right consistency check, and a
-  correlation-confidence gate itself; it does **not** use any OpenCV stereo class.
-  OpenCV is used only for box-filter window sums and image arithmetic as numerical
-  primitives. NCC is invariant to brightness/contrast differences between the two
-  cameras, which the raw SAD/SSD cost is not.
+* `DenseStereoBackend::Custom` (`CustomDenseMatcher`) — **our own** hierarchical
+  coarse-to-fine normalized cross-correlation (NCC) block matcher. It builds an
+  image pyramid (from `customCoarsestDownscale` ≈ 0.0625 up to
+  `customFinalDownscale` = 0.5) and does a **full, width-derived disparity search**
+  on the tiny coarsest level (no hand-tuned `numDisparities`); each finer level then
+  warps the target image by the upsampled prior disparity (`cv::remap`) and searches
+  only a small `±customResidualRadius` residual around it. It builds the cost volume,
+  winner-take-all disparity, parabola subpixel refinement, a full-pyramid left-right
+  consistency check, and a correlation-confidence gate itself; it does **not** use
+  any OpenCV stereo class. OpenCV is used only for box-filter window sums,
+  resize/remap and image arithmetic as numerical primitives. NCC is invariant to
+  brightness/contrast differences between the two cameras, which the raw SAD/SSD cost
+  is not.
 
 `CreateDenseMatcher(backend)` returns the right implementation. `main` currently
 runs **both** so the maps can be compared; to use just one, instantiate the single
 backend you want.
 
-Because NCC block matching is `O(numDisparities)` window passes, the custom matcher
-runs on a downscaled rectified pair (`customDownscale`, default 0.25) and then
-upscales/rescales the disparity back to full resolution, keeping
-`DepthReconstructor` unchanged. Its knobs (`customWindowSize`, `customNumDisparities`,
-`customMinDisparity`, `customLrConsistency`, `customMinCorrelation`,
-`customSubpixel`) live in `DenseStereoConfig`.
+Deriving the disparity range from image geometry means the custom matcher needs no
+`numDisparities` bound: the coarsest level searches `round(coarsest_width *
+customMaxDisparityFraction)` (default 1/3 of the width) and the pyramid refines from
+there, so the final disparity is produced at `customFinalDownscale` and then
+upscaled/rescaled to full resolution, keeping `DepthReconstructor` unchanged. After
+matching, a valid-aware median (`customMedianKernel`, over valid neighbours only) and
+our own connected-component speckle filter (`customSpeckleMinArea`,
+`customSpeckleTolerance`) clean the map at working resolution. Its knobs
+(`customFinalDownscale`, `customCoarsestDownscale`, `customWindowSize`,
+`customResidualRadius`, `customMaxDisparityFraction`, `customLrConsistency`,
+`customMinCorrelation`, `customSubpixel`, `customMedianKernel`,
+`customSpeckleMinArea`, `customSpeckleTolerance`) live in `DenseStereoConfig`.
 
 ## Depth reconstruction (`DepthReconstructor`)
 
 `DepthReconstructor` turns the disparity map into 3D geometry:
 
-* Uses the rectification `Q` matrix (`cv::reprojectImageTo3D`) to back-project each
-  valid disparity pixel into a 3D point, colored from the rectified left image.
+* Back-projects each valid disparity pixel into a 3D point via one of two backends,
+  selected by `DepthReconstructionConfig::backend`:
+  * `DepthBackend::Custom` (default) — **our own** per-pixel homogeneous
+    back-projection `[X,Y,Z,W] = Q · [x, y, d, 1]` (equivalently `Z = f·B/d`). When
+    `validateAgainstOpenCv` is set it also runs `cv::reprojectImageTo3D` and logs the
+    max absolute component difference as a sanity check (the two agree to ~1e-4).
+  * `DepthBackend::OpenCv` — `cv::reprojectImageTo3D`, kept only for comparison.
+  Points are colored from the rectified left image.
 * The result is **up to scale** because the recovered translation is unit-length.
   Set `DepthReconstructionConfig::metricBaseline` to the real baseline (in meters,
   computable from the ETH3D `images.txt` poses) for metric depth.
@@ -274,7 +327,11 @@ upscales/rescales the disparity back to full resolution, keeping
   percentile adapts automatically. Set an explicit `maxDepth` to override.
 * Exports a colored point cloud and a triangle mesh (neighboring valid pixels are
   triangulated; quads spanning a depth discontinuity are skipped to avoid stretched
-  faces). Poisson meshing can be added later.
+  faces). The `.ply` files are written as **binary little-endian**, and
+  `exportGridStep` (default 2 in `main`) strides the point-cloud/mesh grid — since
+  the custom matcher runs at 0.5 scale, step 2 is effectively lossless and keeps
+  `mesh_custom.ply` around ~64 MB instead of the >500 MB an ASCII full-grid export
+  would produce. Poisson meshing can be added later.
 
 ## Custom Geometry Implementation
 
@@ -283,11 +340,14 @@ fundamental-matrix estimation module.
 
 ### Custom normalized 8-point algorithm
 
-Implemented in:
+A Hartley-normalized 8-point solver wrapped in a Sampson-error RANSAC loop is the
+primary fundamental-matrix path; `cv::findFundamentalMat` is retained only for
+comparison logging. Implemented in:
 
 ```text
 include/CustomEightPoint.h
 src/CustomEightPoint.cpp
+```
 
 ## Current Notes
 
@@ -303,18 +363,20 @@ src/CustomEightPoint.cpp
   `wlsConfidenceThreshold` (default 0.5) drops the low-confidence (guessed) pixels
   so coverage reflects actually-matched geometry. Lower it (or set 0) for a denser
   but partly-interpolated map; raise it for a sparser, more trustworthy one.
-* `numDisparities` (default 320) must cover the scene's disparity range; the
-  matcher prints the observed range and warns if it hits the search bound. A few
-  border pixels (the left strip with no right-image overlap) always saturate — the
-  confidence gate removes them.
-* **Custom NCC matcher** (`DenseStereoBackend::Custom`): on `delivery_area` it is
-  denser than the gated OpenCV map (~53% vs ~17% valid) and recovers the same scene
-  structure / near-far gradient, but is coarser (downscaled then nearest-upscaled)
-  and noisier on textureless regions such as the floor, where NCC is unreliable.
+* `numDisparities` (default 704) must cover the scene's disparity range; the
+  matcher prints the observed range and warns if it hits the search bound.
+  `delivery_area`'s true disparity range reaches ~690 full-res px, so the previous
+  320 clamped all the near geometry. A few border pixels (the left strip with no
+  right-image overlap) always saturate — the confidence gate removes them.
+* **Custom NCC matcher** (`DenseStereoBackend::Custom`): the hierarchical
+  coarse-to-fine search recovers the same scene structure / near-far gradient as the
+  OpenCV map and, because the coarsest level derives its disparity range from the
+  image width, needs no hand-tuned search bound to reach the nearest geometry. It can
+  still be noisier on textureless regions such as the floor, where NCC is unreliable.
   Tighten `customMinCorrelation` and/or `customLrConsistency`, raise
-  `customWindowSize`, or increase `customDownscale` to trade density for cleanliness.
-  Its disparity also reaches the search bound (`customNumDisparities`) — raise it to
-  recover the nearest geometry.
+  `customWindowSize`, or grow the valid-aware post-filters (`customMedianKernel`,
+  `customSpeckleMinArea`) to trade density for cleanliness; lower
+  `customFinalDownscale` (0.5 → 0.25) if the 25 MP pairs are too slow.
 * The recovered translation vector currently provides direction only, so reconstruction is up to scale. Metric depth requires the known camera baseline (from `images.txt`).
 * **Left/right ordering:** disparity matching assumes the second camera is to the right (`t.x < 0`). `main` now checks the recovered translation and, if `t.x > 0`, swaps the pair and recomputes the geometry so disparities are correct (on `delivery_area` this raised valid-disparity coverage from ~13% to ~20%). `DepthReconstructor` also keeps a cloud-orientation safety net.
 * **Known issue to address:** `DenseStereoMatcher` calls `StereoBM::compute(right, left)` but `StereoSGBM::compute(left, right)` — the inconsistent argument order flips the disparity sign for the BM path (the SGBM path used by default is correct).

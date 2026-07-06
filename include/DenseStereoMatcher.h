@@ -33,7 +33,10 @@ struct DenseStereoConfig
 	DenseStereoMethod method = DenseStereoMethod::StereoSGBM;
 
 	int minDisparity = 0;
-	int numDisparities = 320;
+	// The true disparity range on delivery_area reaches ~690 full-res px
+	// (measured by the custom matcher's width-derived coarse search and confirmed
+	// against ground truth); 320 clamped all near geometry. Must be a multiple of 16.
+	int numDisparities = 704;
 	// 5 gives the sharpest result on delivery_area with WLS on; larger windows
 	// over-smooth (note p1/p2 derive from blockSize^2, so they grow too).
 	int blockSize = 5;
@@ -70,35 +73,66 @@ struct DenseStereoConfig
 
 	// --- Custom NCC block matcher (DenseStereoBackend::Custom) ------------------
 	// The custom matcher is our own implementation (no OpenCV stereo classes); it
-	// only uses OpenCV for box filtering and image arithmetic as numerical
-	// primitives. It is O(numDisparities) box-filter passes, so it is run on a
-	// downscaled rectified pair for tractable runtime, then the disparity is
-	// upscaled and rescaled back to full resolution.
+	// only uses OpenCV for box filtering, resize/remap and image arithmetic as
+	// numerical primitives. It is a hierarchical coarse-to-fine NCC matcher: it
+	// full-searches disparity on a tiny coarsest pyramid level, then refines that
+	// estimate with a small residual search at each finer level, so the disparity
+	// range is derived from the image geometry rather than a hand-tuned bound.
 
 	CustomCostMetric customCostMetric = CustomCostMetric::NCC;
 
-	// Working resolution as a fraction of the full rectified image (1.0 = full).
-	// Smaller -> much faster, coarser disparities. 0.25 is a good default on the
-	// 25 MP ETH3D pairs.
-	double customDownscale = 0.25;
+	// Finest working level as a fraction of the full rectified image. The final
+	// disparity is produced here and then upscaled/rescaled to full resolution.
+	// 0.5 keeps detail on the 25 MP ETH3D pairs; drop to 0.25 if too slow.
+	double customFinalDownscale = 0.5;
 
-	// Correlation window (odd) and disparity search range, both in *downscaled*
-	// pixels. customNumDisparities need not be a multiple of 16 (that is an
-	// OpenCV-only constraint).
+	// Coarsest pyramid level as a fraction of full resolution. The pyramid is
+	// built by repeated halving from customFinalDownscale down to (roughly) this
+	// value; the coarsest level carries the unconstrained full disparity search.
+	double customCoarsestDownscale = 0.0625;
+
+	// Correlation window (odd), in working-resolution pixels. Shared across levels.
 	int customWindowSize = 9;
-	int customMinDisparity = 0;
-	int customNumDisparities = 96;
 
-	// Left-right consistency: re-match right->left and reject pixels whose two
-	// disparities disagree by more than this (downscaled px). <= 0 disables.
+	// Residual search half-range (+/- pixels) at each refine level: after warping
+	// the target by the upsampled prior, we only look this far for the leftover
+	// disparity, which keeps the per-level cost tiny.
+	int customResidualRadius = 4;
+
+	// Coarsest-level full search range = round(coarsest_width * this). Sets the
+	// maximum representable disparity (in coarsest px); 1/3 of the width is a
+	// generous bound that covers the near-field on the ETH3D scenes.
+	double customMaxDisparityFraction = 1.0 / 3.0;
+
+	// Left-right consistency: re-run the whole pyramid right->left and reject final
+	// pixels whose two disparities disagree by more than this (working px). <= 0
+	// disables.
 	float customLrConsistency = 1.0f;
 
 	// Reject matches whose best NCC correlation is below this (0..1) as untextured
-	// / unreliable.
-	float customMinCorrelation = 0.5f;
+	// / unreliable. Applied at every level's gate.
+	// 0.6 is the measured sweet spot on delivery_area: vs 0.5 it improves both
+	// accuracy AND coverage (bad matches die early in the pyramid instead of at
+	// the LR check); 0.7 gains little accuracy but costs ~1.4pp coverage.
+	float customMinCorrelation = 0.6f;
 
-	// Parabola subpixel refinement of the winning disparity.
+	// Parabola subpixel refinement of the winning (residual) disparity, applied at
+	// every level.
 	bool customSubpixel = true;
+
+	// Valid-aware median filter kernel (odd) at final working resolution, our own
+	// implementation over valid neighbours only. Removes salt-and-pepper noise
+	// without inventing values at invalid pixels. 0 disables.
+	int customMedianKernel = 3;
+
+	// Custom speckle filter: connected components (4-connectivity, neighbours
+	// joined iff both valid and within customSpeckleTolerance) smaller than this
+	// many working-resolution pixels are discarded as speckle. 0 disables.
+	int customSpeckleMinArea = 100;
+
+	// Maximum |disparity difference| (working px) for two neighbours to belong to
+	// the same speckle component.
+	float customSpeckleTolerance = 1.0f;
 };
 
 struct DenseMatchingResult

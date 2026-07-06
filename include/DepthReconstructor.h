@@ -6,8 +6,27 @@
 #include "StereoRectifier.h"
 #include "DenseStereoMatcher.h"
 
+/*
+	Selects how the disparity map is back-projected into 3D. Custom is our own
+	per-pixel homogeneous back-projection (what the TA wants us to own); OpenCv
+	keeps cv::reprojectImageTo3D around purely for validation/comparison.
+*/
+enum class DepthBackend { OpenCv, Custom };
+
 struct DepthReconstructionConfig
 {
+	DepthBackend backend = DepthBackend::Custom;
+
+	// When backend == Custom, also run cv::reprojectImageTo3D and print the max
+	// absolute component difference against our result (cheap sanity check for
+	// the report; the reference and ours should agree to ~1e-3).
+	bool validateAgainstOpenCv = true;
+
+	// Sample the organized point grid every exportGridStep rows/cols when writing
+	// the PLY point cloud / mesh. 1 keeps every point; larger values shrink the
+	// exported files (the custom matcher runs at 0.5 scale, so step 2 is lossless).
+	int exportGridStep = 1;
+
 	/*
 		recoverPose() returns a unit-length translation, so the rectified
 		reconstruction is only known up to scale. Set metricBaseline to the
@@ -42,8 +61,8 @@ struct ReconstructionResult
 
 	int ValidPointCount() const;
 
-	void WritePointCloudPly(const std::filesystem::path& outputPath) const;
-	void WriteMeshPly(const std::filesystem::path& outputPath, float maxEdgeDepthDiff) const;
+	void WritePointCloudPly(const std::filesystem::path& outputPath, int step = 1) const;
+	void WriteMeshPly(const std::filesystem::path& outputPath, float maxEdgeDepthDiff, int step = 1) const;
 
 	// Writes depth_<tag>_float.tiff + valid_depth_<tag>_mask.tiff (or the
 	// un-tagged names when tag is empty) into outputDir.

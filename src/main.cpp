@@ -144,6 +144,10 @@ int main()
 		depthConfig.metricBaseline = metricBaseline; // metric baseline recovered from the ETH3D poses
 		// maxDepth left at 0: DepthReconstructor clips far outliers at maxDepthPercentile
 		// (scene-adaptive). Set depthConfig.maxDepth explicitly to override.
+		// Export every 2nd grid point for both backends: the custom matcher works at
+		// 0.5 scale so step 2 loses nothing, and it makes the meshes ~4x smaller and
+		// MeshLab-safe on an old PC.
+		depthConfig.exportGridStep = 2;
 
 		ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, denseResult, depthConfig);
 		reconstruction.WriteDepthMapTiff(outputDir, run.tag);
@@ -151,8 +155,8 @@ int main()
 
 		if (reconstruction.ValidPointCount() > 0)
 		{
-			reconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + run.tag + ".ply"));
-			reconstruction.WriteMeshPly(outputDir / ("mesh_" + run.tag + ".ply"), depthConfig.maxMeshEdgeDepthDiff);
+			reconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + run.tag + ".ply"), depthConfig.exportGridStep);
+			reconstruction.WriteMeshPly(outputDir / ("mesh_" + run.tag + ".ply"), depthConfig.maxMeshEdgeDepthDiff, depthConfig.exportGridStep);
 		}
 		else
 		{

@@ -119,7 +119,86 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 	const cv::Mat reprojectionMatrixQ = ConvertQToOpenCv(rectificationResult.reprojectionMatrixQ);
 
 	cv::Mat points3D;
-	cv::reprojectImageTo3D(denseResult.rawDisparity, points3D, reprojectionMatrixQ, true, CV_32F);
+	if (config.backend == DepthBackend::OpenCv)
+	{
+		cv::reprojectImageTo3D(denseResult.rawDisparity, points3D, reprojectionMatrixQ, true, CV_32F);
+	}
+	else
+	{
+		// Our own back-projection: for each pixel [X,Y,Z,W]^T = Q * [x, y, d, 1]^T,
+		// then point = (X/W, Y/W, Z/W). The multiply is done in double precision and
+		// cast to float. For a stereoRectify Q this reduces to the classic
+		// triangulation formula Z = f*B/d. Pixels with invalid disparity (mask 0) get
+		// the same large sentinel (Z = 10000) that cv::reprojectImageTo3D uses for its
+		// missing values, so the downstream base-mask check |Z| >= 9999 culls them.
+		const Eigen::Matrix4d& Q = rectificationResult.reprojectionMatrixQ;
+		const float missingSentinel = 10000.0f;
+
+		points3D.create(denseResult.rawDisparity.size(), CV_32FC3);
+
+		for (int row = 0; row < points3D.rows; ++row)
+		{
+			for (int col = 0; col < points3D.cols; ++col)
+			{
+				cv::Vec3f& out = points3D.at<cv::Vec3f>(row, col);
+
+				if (denseResult.validDisparityMask.at<unsigned char>(row, col) == 0)
+				{
+					out = cv::Vec3f(missingSentinel, missingSentinel, missingSentinel);
+					continue;
+				}
+
+				const double x = static_cast<double>(col);
+				const double y = static_cast<double>(row);
+				const double d = static_cast<double>(denseResult.rawDisparity.at<float>(row, col));
+
+				const double X = Q(0, 0) * x + Q(0, 1) * y + Q(0, 2) * d + Q(0, 3);
+				const double Y = Q(1, 0) * x + Q(1, 1) * y + Q(1, 2) * d + Q(1, 3);
+				const double Z = Q(2, 0) * x + Q(2, 1) * y + Q(2, 2) * d + Q(2, 3);
+				const double W = Q(3, 0) * x + Q(3, 1) * y + Q(3, 2) * d + Q(3, 3);
+
+				if (std::abs(W) < 1e-12)
+				{
+					out = cv::Vec3f(missingSentinel, missingSentinel, missingSentinel);
+					continue;
+				}
+
+				out = cv::Vec3f(static_cast<float>(X / W), static_cast<float>(Y / W), static_cast<float>(Z / W));
+			}
+		}
+
+		// Verify our back-projection against the OpenCV reference over the pixels that
+		// are valid in both, so the report can log "verified against the reference".
+		if (config.validateAgainstOpenCv)
+		{
+			cv::Mat reference;
+			cv::reprojectImageTo3D(denseResult.rawDisparity, reference, reprojectionMatrixQ, true, CV_32F);
+
+			double maxDiff = 0.0;
+			int comparedCount = 0;
+			for (int row = 0; row < points3D.rows; ++row)
+			{
+				for (int col = 0; col < points3D.cols; ++col)
+				{
+					if (denseResult.validDisparityMask.at<unsigned char>(row, col) == 0) { continue; }
+
+					const cv::Vec3f& ours = points3D.at<cv::Vec3f>(row, col);
+					const cv::Vec3f& ref = reference.at<cv::Vec3f>(row, col);
+					if (!IsFinitePoint(ours) || !IsFinitePoint(ref)) { continue; }
+					if (std::abs(ours[2]) >= 9999.0f || std::abs(ref[2]) >= 9999.0f) { continue; }
+
+					for (int k = 0; k < 3; ++k)
+					{
+						maxDiff = std::max(maxDiff, static_cast<double>(std::abs(ours[k] - ref[k])));
+					}
+					++comparedCount;
+				}
+			}
+
+			std::cout << "Custom back-projection verified against cv::reprojectImageTo3D: max abs component diff = "
+				<< maxDiff << " over " << comparedCount << " pixels." << std::endl;
+		}
+	}
 
 	/*
 		The Q matrix was built from a unit-length translation, so the result is
@@ -224,9 +303,11 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 	return result;
 }
 
-void ReconstructionResult::WritePointCloudPly(const std::filesystem::path& outputPath) const
+void ReconstructionResult::WritePointCloudPly(const std::filesystem::path& outputPath, int step) const
 {
 	if (points3D.empty()) { throw std::runtime_error("Cannot write an empty point cloud."); }
+
+	const int stride = std::max(1, step); // sample every 'stride' rows/cols
 
 	std::filesystem::create_directories(outputPath.parent_path());
 
@@ -235,7 +316,15 @@ void ReconstructionResult::WritePointCloudPly(const std::filesystem::path& outpu
 	std::ofstream file(outputPath, std::ios::binary);
 	if (!file.is_open()) { throw std::runtime_error("Failed to open output file: " + outputPath.string()); }
 
-	const int vertexCount = ValidPointCount();
+	// Count the strided valid pixels up front for the header.
+	int vertexCount = 0;
+	for (int row = 0; row < points3D.rows; row += stride)
+	{
+		for (int col = 0; col < points3D.cols; col += stride)
+		{
+			if (validMask.at<unsigned char>(row, col) != 0) { ++vertexCount; }
+		}
+	}
 
 	file << "ply\n";
 	file << "format binary_little_endian 1.0\n";
@@ -244,9 +333,9 @@ void ReconstructionResult::WritePointCloudPly(const std::filesystem::path& outpu
 	file << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
 	file << "end_header\n";
 
-	for (int row = 0; row < points3D.rows; ++row)
+	for (int row = 0; row < points3D.rows; row += stride)
 	{
-		for (int col = 0; col < points3D.cols; ++col)
+		for (int col = 0; col < points3D.cols; col += stride)
 		{
 			if (validMask.at<unsigned char>(row, col) == 0) { continue; }
 
@@ -257,21 +346,23 @@ void ReconstructionResult::WritePointCloudPly(const std::filesystem::path& outpu
 		}
 	}
 
-	std::cout << "Point cloud written to " << outputPath.string() << " (" << vertexCount << " points)." << std::endl;
+	std::cout << "Point cloud written to " << outputPath.string() << " (" << vertexCount << " points, step " << stride << ")." << std::endl;
 }
 
-void ReconstructionResult::WriteMeshPly(const std::filesystem::path& outputPath, float maxEdgeDepthDiff) const
+void ReconstructionResult::WriteMeshPly(const std::filesystem::path& outputPath, float maxEdgeDepthDiff, int step) const
 {
 	if (points3D.empty()) { throw std::runtime_error("Cannot mesh an empty reconstruction."); }
 
-	// Assign a contiguous vertex index to every valid pixel.
+	const int stride = std::max(1, step); // triangulate the grid sampled every 'stride' rows/cols
+
+	// Assign a contiguous vertex index to every valid pixel on the strided grid.
 	cv::Mat vertexIndex(points3D.size(), CV_32S, cv::Scalar(-1));
 	int nextIndex = 0;
 
 	double sumZ = 0.0;
-	for (int row = 0; row < points3D.rows; ++row)
+	for (int row = 0; row < points3D.rows; row += stride)
 	{
-		for (int col = 0; col < points3D.cols; ++col)
+		for (int col = 0; col < points3D.cols; col += stride)
 		{
 			if (validMask.at<unsigned char>(row, col) == 0) { continue; }
 			vertexIndex.at<int>(row, col) = nextIndex++;
@@ -289,12 +380,13 @@ void ReconstructionResult::WriteMeshPly(const std::filesystem::path& outputPath,
 		depthThreshold = 0.02f * meanZ;
 	}
 
-	const auto isQuadConnected = [&](int r, int c) -> bool
+	// Depth-discontinuity cull across the four corners of a strided cell.
+	const auto isQuadConnected = [&](int r, int c, int rNext, int cNext) -> bool
 	{
 		const float z00 = points3D.at<cv::Vec3f>(r, c)[2];
-		const float z01 = points3D.at<cv::Vec3f>(r, c + 1)[2];
-		const float z10 = points3D.at<cv::Vec3f>(r + 1, c)[2];
-		const float z11 = points3D.at<cv::Vec3f>(r + 1, c + 1)[2];
+		const float z01 = points3D.at<cv::Vec3f>(r, cNext)[2];
+		const float z10 = points3D.at<cv::Vec3f>(rNext, c)[2];
+		const float z11 = points3D.at<cv::Vec3f>(rNext, cNext)[2];
 
 		const float maxZ = std::max(std::max(z00, z01), std::max(z10, z11));
 		const float minZ = std::min(std::min(z00, z01), std::min(z10, z11));
@@ -304,17 +396,20 @@ void ReconstructionResult::WriteMeshPly(const std::filesystem::path& outputPath,
 
 	std::vector<std::array<int, 3>> faces;
 
-	for (int row = 0; row < points3D.rows - 1; ++row)
+	for (int row = 0; row + stride < points3D.rows; row += stride)
 	{
-		for (int col = 0; col < points3D.cols - 1; ++col)
+		for (int col = 0; col + stride < points3D.cols; col += stride)
 		{
+			const int rNext = row + stride;
+			const int cNext = col + stride;
+
 			const int i00 = vertexIndex.at<int>(row, col);
-			const int i01 = vertexIndex.at<int>(row, col + 1);
-			const int i10 = vertexIndex.at<int>(row + 1, col);
-			const int i11 = vertexIndex.at<int>(row + 1, col + 1);
+			const int i01 = vertexIndex.at<int>(row, cNext);
+			const int i10 = vertexIndex.at<int>(rNext, col);
+			const int i11 = vertexIndex.at<int>(rNext, cNext);
 
 			if (i00 < 0 || i01 < 0 || i10 < 0 || i11 < 0) { continue; }
-			if (!isQuadConnected(row, col)) { continue; }
+			if (!isQuadConnected(row, col, rNext, cNext)) { continue; }
 
 			faces.push_back({ i00, i10, i11 });
 			faces.push_back({ i00, i11, i01 });
@@ -337,9 +432,10 @@ void ReconstructionResult::WriteMeshPly(const std::filesystem::path& outputPath,
 	file << "property list uchar int vertex_indices\n";
 	file << "end_header\n";
 
-	for (int row = 0; row < points3D.rows; ++row)
+	// Emit vertices in the same strided order the indices were assigned in.
+	for (int row = 0; row < points3D.rows; row += stride)
 	{
-		for (int col = 0; col < points3D.cols; ++col)
+		for (int col = 0; col < points3D.cols; col += stride)
 		{
 			if (validMask.at<unsigned char>(row, col) == 0) { continue; }
 

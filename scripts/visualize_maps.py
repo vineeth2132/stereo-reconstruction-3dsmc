@@ -55,6 +55,20 @@ def load_map(out_dir: Path, kind: str, tag: str) -> np.ndarray | None:
     return out
 
 
+def load_gt_depth(out_dir: Path) -> np.ndarray | None:
+    """Load the rectified GT depth (metric meters) as a float array with NaN at
+    invalid pixels. Invalid GT is encoded as NaN or non-positive depth (mirrors
+    scripts/evaluate_depth.py). Returns None if the file is missing."""
+    gt_path = out_dir / "gt_depth_rectified_float.tiff"
+    if not gt_path.exists():
+        return None
+
+    gt = tifffile.imread(gt_path).astype(np.float32)
+    gt[~np.isfinite(gt)] = np.nan
+    gt[gt <= 0.0] = np.nan
+    return gt
+
+
 def render_single(data: np.ndarray, title: str, cbar_label: str, dest: Path) -> None:
     cmap = plt.get_cmap("turbo").copy()
     cmap.set_bad("white")  # invalid (NaN) pixels -> white
@@ -76,26 +90,36 @@ def render_single(data: np.ndarray, title: str, cbar_label: str, dest: Path) -> 
     print(f"  wrote {dest.name}")
 
 
-def render_comparison(maps: dict[str, np.ndarray], kind: str, cbar_label: str, dest: Path) -> None:
-    """Side-by-side panels sharing one color scale, so the backends are comparable."""
+def render_comparison(maps: dict[str, np.ndarray], kind: str, cbar_label: str, dest: Path,
+                      gt: np.ndarray | None = None,
+                      gt_title: str = "Ground truth (laser)") -> None:
+    """Side-by-side panels sharing one color scale, so the backends are comparable.
+    When ``gt`` is provided it is appended as an extra panel; the shared scale spans
+    every panel (backends + GT)."""
     tags = [t for t in ("opencv", "custom") if t in maps]
     if not tags:
         return
 
-    # Shared scale across panels for a fair visual comparison.
-    finite = np.concatenate([maps[t][np.isfinite(maps[t])].ravel() for t in tags])
+    # Ordered panels: backends first, then the ground-truth reference if available.
+    panels: list[tuple[str, np.ndarray]] = [(f"{kind} — {tag}", maps[tag]) for tag in tags]
+    if gt is not None:
+        panels.append((gt_title, gt))
+
+    # Shared scale across ALL panels (backends + GT) for a fair visual comparison.
+    finite = np.concatenate([m[np.isfinite(m)].ravel() for _, m in panels])
     vmin = float(np.percentile(finite, 1)) if finite.size else 0.0
     vmax = float(np.percentile(finite, 99)) if finite.size else 1.0
 
     cmap = plt.get_cmap("turbo").copy()
     cmap.set_bad("white")
 
-    fig, axes = plt.subplots(1, len(tags), figsize=(9 * len(tags), 6), squeeze=False)
+    fig, axes = plt.subplots(1, len(panels), figsize=(9 * len(panels), 6), squeeze=False)
     im = None
-    for ax, tag in zip(axes[0], tags):
-        im = ax.imshow(maps[tag], cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-        valid_pct = 100.0 * np.isfinite(maps[tag]).mean()
-        ax.set_title(f"{kind} — {tag}  ({valid_pct:.1f}% valid)")
+    for ax, (title, m) in zip(axes[0], panels):
+        im = ax.imshow(m, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+        # % of the whole image frame that is valid (unambiguous denominator).
+        valid_pct = 100.0 * np.isfinite(m).mean()
+        ax.set_title(f"{title}  (valid: {valid_pct:.1f}% of image px)")
         ax.set_xticks([])
         ax.set_yticks([])
 
@@ -123,6 +147,11 @@ def main() -> None:
         ("depth", "Depth Z (up to scale)"),
     ]
 
+    gt_depth = load_gt_depth(out_dir)
+    if gt_depth is None:
+        print("note: gt_depth_rectified_float.tiff not found — "
+              "comparison figures fall back to 2 panels (opencv | custom)")
+
     for kind, cbar_label in specs:
         print(f"{kind}:")
         loaded: dict[str, np.ndarray] = {}
@@ -134,8 +163,28 @@ def main() -> None:
             title = f"{kind.capitalize()} map — {tag} (white = invalid)"
             render_single(data, title, cbar_label, out_dir / f"{kind}_{tag}_scaled.png")
 
+        # Build the ground-truth panel for this kind (None -> 2-panel fallback).
+        gt_panel: np.ndarray | None = None
+        if gt_depth is not None:
+            if kind == "depth":
+                gt_panel = gt_depth
+            else:
+                # No GT disparity file exists, so derive it. For rectified stereo the
+                # product disparity * depth is the constant focal*baseline (fB); recover
+                # it as the median over pixels valid in both custom maps, then invert
+                # the GT depth: gt_disparity = fB / gt_depth (NaN where GT is invalid).
+                disp_custom = loaded.get("custom")
+                depth_custom = load_map(out_dir, "depth", "custom")
+                if disp_custom is not None and depth_custom is not None:
+                    both = np.isfinite(disp_custom) & np.isfinite(depth_custom)
+                    if both.any():
+                        fB = float(np.median(disp_custom[both] * depth_custom[both]))
+                        print(f"  derived fB (focal*baseline) = {fB:.4f}")
+                        gt_panel = fB / gt_depth
+
         if len(loaded) >= 2:
-            render_comparison(loaded, kind, cbar_label, out_dir / f"comparison_{kind}.png")
+            render_comparison(loaded, kind, cbar_label, out_dir / f"comparison_{kind}.png",
+                              gt=gt_panel)
 
 
 if __name__ == "__main__":
