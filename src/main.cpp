@@ -9,13 +9,14 @@
 #include "StereoRectifier.h"
 #include "DenseStereoMatcher.h"
 #include "DepthReconstructor.h"
+#include "DepthMapEvaluator.h"
 
 int main()
 {
-	const std::filesystem::path outputDir = "../out";
+	const std::filesystem::path outputDir = "out";
 	std::filesystem::create_directories(outputDir);
 
-	DataLoader dataLoader("../data/delivery_area/");
+	DataLoader dataLoader("data/delivery_area/");
 	StereoImagePair imagePair = dataLoader.LoadStereoPair("images/dslr_images_undistorted/DSC_0688.jpg", "images/dslr_images_undistorted/DSC_0689.jpg");
 	//imagePair.ShowResized(0.15);
 
@@ -58,6 +59,42 @@ int main()
 	// Step output: rectified pair (open in an image viewer to confirm rows align).
 	cv::imwrite((outputDir / "rectified_left.png").string(), rectResult.rectifiedLeftImage);
 	cv::imwrite((outputDir / "rectified_right.png").string(), rectResult.rectifiedRightImage);
+
+	/*
+		Metric baseline recovered once from the ETH3D images.txt poses. Feeds the
+		depth reconstruction for both backends so the depth is metric instead of
+		up-to-scale.
+	*/
+	float metricBaseline = dataLoader.LoadMetricBaselineFromImagesTxt("dslr_calibration_undistorted/images.txt", imagePair.leftImgPath.filename().string(), imagePair.rightImgPath.filename().string());
+	std::cout << "Calculated Metric Baseline = " << metricBaseline << std::endl;
+
+	/*
+		Ground-truth depth (ETH3D) for evaluation, done once independent of the
+		dense backend. The raw depth is loaded at the original DSLR resolution and
+		rectified into the left rectified frame. This data may not be downloaded
+		yet, so guard the whole block and continue without it if anything fails.
+	*/
+	try
+	{
+		std::string gtDepthRelativePath = "ground_truth_depth/dslr_images/" + imagePair.leftImgPath.stem().string() + ".jpg";
+		cv::Mat gtDepthRaw = dataLoader.LoadGroundTruthDepthMap(gtDepthRelativePath, 6048, 4032); // 6048x4032: the raw image resolution the ETH3D depth is stored at.
+		if (gtDepthRaw.empty())
+		{
+			throw std::runtime_error("Ground truth depth map is empty.");
+		}
+		cv::imwrite((outputDir / "gt_depth_raw_float.tiff").string(), gtDepthRaw);
+
+		RawCameraCalibration rawCalibration = dataLoader.LoadRawCameraCalibration("dslr_calibration_jpg/cameras.txt");
+
+		DepthMapEvaluator evaluator;
+		cv::Mat gtDepthRectified = evaluator.RectifyGroundTruthDepth(gtDepthRaw, rawCalibration, rectResult, rectResult.rectifiedLeftImage.size());
+		cv::imwrite((outputDir / "gt_depth_rectified_float.tiff").string(), gtDepthRectified);
+	}
+	catch (const std::exception& error)
+	{
+		std::cout << "Warning: skipping ground-truth depth evaluation (" << error.what()
+			<< "). Download the ground_truth_depth data to enable it." << std::endl;
+	}
 
 	/*
 		Dense stage, run for every backend so the OpenCV and our own custom matcher
@@ -104,7 +141,7 @@ int main()
 
 		// Depth -> colored point cloud + mesh (identical tail for both backends).
 		DepthReconstructionConfig depthConfig;
-		depthConfig.metricBaseline = 1.0; // up to scale; set the real ETH3D baseline (m) for metric depth
+		depthConfig.metricBaseline = metricBaseline; // metric baseline recovered from the ETH3D poses
 		// maxDepth left at 0: DepthReconstructor clips far outliers at maxDepthPercentile
 		// (scene-adaptive). Set depthConfig.maxDepth explicitly to override.
 

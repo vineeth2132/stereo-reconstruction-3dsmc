@@ -8,7 +8,7 @@ The current pipeline performs:
 2. Camera intrinsics loading
 3. SIFT keypoint detection
 4. Sparse feature matching with ratio filtering
-5. Fundamental matrix estimation with RANSAC
+5. Fundamental matrix estimation using a custom normalized 8-point algorithm with custom RANSAC, with OpenCV kept only for comparison/debugging
 6. Essential matrix computation
 7. Relative camera pose recovery
 8. Stereo rectification
@@ -275,6 +275,19 @@ upscales/rescales the disparity back to full resolution, keeping
 * Exports a colored point cloud and a triangle mesh (neighboring valid pixels are
   triangulated; quads spanning a depth discontinuity are skipped to avoid stretched
   faces). Poisson meshing can be added later.
+
+## Custom Geometry Implementation
+
+As part of replacing OpenCV building blocks, the project now includes a custom
+fundamental-matrix estimation module.
+
+### Custom normalized 8-point algorithm
+
+Implemented in:
+
+```text
+include/CustomEightPoint.h
+src/CustomEightPoint.cpp
 
 ## Current Notes
 

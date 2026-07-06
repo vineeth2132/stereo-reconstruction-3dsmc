@@ -29,6 +29,27 @@ struct CameraIntrinsics
 	void Print() const;
 };
 
+struct RawCameraCalibration
+{
+	int imageWidth = 0;
+	int imageHeight = 0;
+
+	double fx = 0.0;
+	double fy = 0.0;
+	double cx = 0.0;
+	double cy = 0.0;
+
+	double k1 = 0.0;
+	double k2 = 0.0;
+	double p1 = 0.0;
+	double p2 = 0.0;
+
+	double k3 = 0.0;
+	double k4 = 0.0;
+
+	double sx1 = 0.0;
+	double sy1 = 0.0;
+};
 
 class DataLoader
 {
@@ -37,6 +58,9 @@ public:
 
 	StereoImagePair LoadStereoPair(const std::filesystem::path& leftImgRelativePath, const std::filesystem::path& rightImgRelativePath);
 	CameraIntrinsics LoadCameraIntrinsics(const std::filesystem::path& cameraFileRelativePath);
+	float LoadMetricBaselineFromImagesTxt(const std::string& imagesTxtRelativePath, const std::string& leftImgName, const std::string& rightImgName);
+	cv::Mat LoadGroundTruthDepthMap(const std::string& depthRelativePath, int width, int height);
+	RawCameraCalibration LoadRawCameraCalibration(const std::filesystem::path& cameraFileRelativePath);
 
 private:
 	cv::Mat LoadImage(const std::filesystem::path& imgPath);

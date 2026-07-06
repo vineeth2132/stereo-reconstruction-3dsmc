@@ -18,7 +18,9 @@ set(SOURCE_FILES
     src/StereoRectifier.cpp
     src/DenseStereoMatcher.cpp
     src/CustomDenseMatcher.cpp
-    src/DepthReconstructor.cpp)
+    src/DepthReconstructor.cpp
+    src/DepthMapEvaluator.cpp
+    src/CustomEightPoint.cpp)
 
 set(HEADER_FILES
     include/DataLoader.h
@@ -27,7 +29,9 @@ set(HEADER_FILES
     include/StereoRectifier.h
     include/DenseStereoMatcher.h
     include/CustomDenseMatcher.h
-    include/DepthReconstructor.h)
+    include/DepthReconstructor.h
+    include/DepthMapEvaluator.h
+    include/CustomEightPoint.h)
 
 add_executable(stereo_reconstruction)
 
