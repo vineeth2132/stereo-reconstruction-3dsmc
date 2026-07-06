@@ -312,23 +312,72 @@ void StereoRectifier::CustomStereoRectify(
     double f = intrinsics.fx;
     double cx = intrinsics.cx;
     double cy = intrinsics.cy;
+    double W = intrinsics.imageWidth;
+    double H = intrinsics.imageHeight;
+
+    Eigen::Matrix3d K_old;
+    K_old << f, 0, cx,
+        0, f, cy,
+        0, 0, 1;
+    Eigen::Matrix3d K_old_inv = K_old.inverse();
+
+    auto projectToRectified = [&](double u, double v, const Eigen::Matrix3d& R_cam) -> Eigen::Vector2d {
+        Eigen::Vector3d p_orig(u, v, 1.0);
+        Eigen::Vector3d d_orig = K_old_inv * p_orig;
+        Eigen::Vector3d d_rect = R_cam * d_orig;
+        return Eigen::Vector2d(
+            f * (d_rect.x() / d_rect.z()) + cx,
+            f * (d_rect.y() / d_rect.z()) + cy
+        );
+        };
+
+    double inner_left = -1e9, inner_right = 1e9, inner_top = -1e9, inner_bottom = 1e9;
+    const int N = 40;
+    std::vector<Eigen::Matrix3d> Rs = { R1, R2 };
+
+    for (const auto& R_cam : Rs) {
+        for (int i = 0; i <= N; ++i) {
+            double step = (double)i / N;
+
+            inner_top = std::max(inner_top, projectToRectified(step * W, 0.0, R_cam).y());
+            inner_bottom = std::min(inner_bottom, projectToRectified(step * W, H, R_cam).y());
+            inner_left = std::max(inner_left, projectToRectified(0.0, step * H, R_cam).x());
+            inner_right = std::min(inner_right, projectToRectified(W, step * H, R_cam).x());
+        }
+    }
+
+    double inner_w = inner_right - inner_left;
+    double inner_h = inner_bottom - inner_top;
+
+    double s = 1.0;
+    if (inner_w > 0 && inner_h > 0) {
+        s = std::max(W / inner_w, H / inner_h);
+    }
+
+    double inner_cx = (inner_left + inner_right) / 2.0;
+    double inner_cy = (inner_top + inner_bottom) / 2.0;
+
+    double f_new = f * s;
+    double cx_new = s * (cx - inner_cx) + (W / 2.0);
+    double cy_new = s * (cy - inner_cy) + (H / 2.0);
+
     double baseline = t.norm();
 
     P1.setZero();
-    P1(0, 0) = f;   P1(1, 1) = f;
-    P1(0, 2) = cx;  P1(1, 2) = cy;
+    P1(0, 0) = f_new;   P1(1, 1) = f_new;
+    P1(0, 2) = cx_new;  P1(1, 2) = cy_new;
     P1(2, 2) = 1.0;
 
     P2 = P1;
-    P2(0, 3) = -f * baseline;
+    P2(0, 3) = -f_new * baseline;
 
     Q.setIdentity();
     Q(0, 0) = 1.0;
     Q(1, 1) = 1.0;
-    Q(0, 3) = -cx;
-    Q(1, 3) = -cy;
+    Q(0, 3) = -cx_new;
+    Q(1, 3) = -cy_new;
     Q(2, 2) = 0.0;
-    Q(2, 3) = f;
+    Q(2, 3) = f_new;
     Q(3, 3) = 0.0;
     Q(3, 2) = 1.0 / baseline;
 }
