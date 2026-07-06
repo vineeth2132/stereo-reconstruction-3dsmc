@@ -1,8 +1,21 @@
 #include "DenseStereoMatcher.h"
+#include "CustomDenseMatcher.h"
 
 #ifdef HAVE_OPENCV_XIMGPROC
 #include <opencv2/ximgproc.hpp>
 #endif
+
+std::unique_ptr<IDenseStereoMatcher> CreateDenseMatcher(DenseStereoBackend backend)
+{
+	switch (backend)
+	{
+	case DenseStereoBackend::Custom:
+		return std::make_unique<CustomDenseMatcher>();
+	case DenseStereoBackend::OpenCv:
+	default:
+		return std::make_unique<DenseStereoMatcher>();
+	}
+}
 
 cv::Mat DenseStereoMatcher::ConvertToGrayscale(const cv::Mat& image) const
 {

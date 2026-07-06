@@ -44,7 +44,10 @@ struct ReconstructionResult
 
 	void WritePointCloudPly(const std::filesystem::path& outputPath) const;
 	void WriteMeshPly(const std::filesystem::path& outputPath, float maxEdgeDepthDiff) const;
-	void WriteDepthMapTiff(const std::filesystem::path& outputPath) const;
+
+	// Writes depth_<tag>_float.tiff + valid_depth_<tag>_mask.tiff (or the
+	// un-tagged names when tag is empty) into outputDir.
+	void WriteDepthMapTiff(const std::filesystem::path& outputDir, const std::string& tag = "") const;
 
 	// for debugging
 	void PrintStats() const;

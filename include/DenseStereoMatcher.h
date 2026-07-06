@@ -1,6 +1,16 @@
 #pragma once
+#include <memory>
 #include <opencv2/opencv.hpp>
 #include "StereoRectifier.h"
+
+// Selects which dense-matching implementation runs behind the common
+// IDenseStereoMatcher interface. OpenCv = library StereoBM/SGBM (+ optional WLS);
+// Custom = our own hand-written NCC block matcher. Switch with a single flag.
+enum class DenseStereoBackend
+{
+	OpenCv,
+	Custom
+};
 
 enum class DenseStereoMethod
 {
@@ -8,8 +18,18 @@ enum class DenseStereoMethod
 	StereoSGBM
 };
 
+// Cost metric for the custom block matcher. Only NCC is wired today; the enum
+// leaves room to add SAD/SSD later without changing the interface.
+enum class CustomCostMetric
+{
+	NCC
+};
+
 struct DenseStereoConfig
 {
+	// Which backend the CreateDenseMatcher factory instantiates.
+	DenseStereoBackend backend = DenseStereoBackend::OpenCv;
+
 	DenseStereoMethod method = DenseStereoMethod::StereoSGBM;
 
 	int minDisparity = 0;
@@ -45,6 +65,38 @@ struct DenseStereoConfig
 		evaluation against ground truth. 0 keeps the full (dense) fill.
 	*/
 	float wlsConfidenceThreshold = 0.5f;
+
+	// --- Custom NCC block matcher (DenseStereoBackend::Custom) ------------------
+	// The custom matcher is our own implementation (no OpenCV stereo classes); it
+	// only uses OpenCV for box filtering and image arithmetic as numerical
+	// primitives. It is O(numDisparities) box-filter passes, so it is run on a
+	// downscaled rectified pair for tractable runtime, then the disparity is
+	// upscaled and rescaled back to full resolution.
+
+	CustomCostMetric customCostMetric = CustomCostMetric::NCC;
+
+	// Working resolution as a fraction of the full rectified image (1.0 = full).
+	// Smaller -> much faster, coarser disparities. 0.25 is a good default on the
+	// 25 MP ETH3D pairs.
+	double customDownscale = 0.25;
+
+	// Correlation window (odd) and disparity search range, both in *downscaled*
+	// pixels. customNumDisparities need not be a multiple of 16 (that is an
+	// OpenCV-only constraint).
+	int customWindowSize = 9;
+	int customMinDisparity = 0;
+	int customNumDisparities = 96;
+
+	// Left-right consistency: re-match right->left and reject pixels whose two
+	// disparities disagree by more than this (downscaled px). <= 0 disables.
+	float customLrConsistency = 1.0f;
+
+	// Reject matches whose best NCC correlation is below this (0..1) as untextured
+	// / unreliable.
+	float customMinCorrelation = 0.5f;
+
+	// Parabola subpixel refinement of the winning disparity.
+	bool customSubpixel = true;
 };
 
 struct DenseMatchingResult
@@ -57,10 +109,22 @@ struct DenseMatchingResult
 	void ShowDisparity() const;
 };
 
-class DenseStereoMatcher
+// Common interface so the OpenCV and custom matchers are drop-in interchangeable:
+// the rest of the pipeline only depends on DenseMatchingResult.
+class IDenseStereoMatcher
 {
 public:
-	DenseMatchingResult ComputeDisparity(const RectificationResult& rectificationResult, const DenseStereoConfig& config) const;
+	virtual ~IDenseStereoMatcher() = default;
+	virtual DenseMatchingResult ComputeDisparity(const RectificationResult& rectificationResult, const DenseStereoConfig& config) const = 0;
+};
+
+// Picks the implementation from config.backend.
+std::unique_ptr<IDenseStereoMatcher> CreateDenseMatcher(DenseStereoBackend backend);
+
+class DenseStereoMatcher : public IDenseStereoMatcher
+{
+public:
+	DenseMatchingResult ComputeDisparity(const RectificationResult& rectificationResult, const DenseStereoConfig& config) const override;
 
 private:
 	cv::Mat ConvertToGrayscale(const cv::Mat& image) const;

@@ -1,4 +1,7 @@
 #include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "DataLoader.h"
 #include "SparseFeatureMatcher.h"
@@ -56,43 +59,69 @@ int main()
 	cv::imwrite((outputDir / "rectified_left.png").string(), rectResult.rectifiedLeftImage);
 	cv::imwrite((outputDir / "rectified_right.png").string(), rectResult.rectifiedRightImage);
 
-	DenseStereoMatcher denseMatcher;
+	/*
+		Dense stage, run for every backend so the OpenCV and our own custom matcher
+		can be compared directly. Both implement IDenseStereoMatcher (selected by
+		config.backend) and feed the identical depth/mesh tail, so the only thing
+		that differs between the tagged outputs is the disparity algorithm. The
+		Python helper scripts/visualize_maps.py renders the tagged maps with a
+		color scale (white = invalid) for the report comparison.
+	*/
+	struct BackendRun
+	{
+		DenseStereoBackend backend;
+		std::string tag;
+		const char* label;
+	};
 
-	DenseStereoConfig sgbmConfig;
-	sgbmConfig.method = DenseStereoMethod::StereoSGBM;
-	sgbmConfig.blockSize = 5;
-	DenseMatchingResult sgbmResult = denseMatcher.ComputeDisparity(rectResult, sgbmConfig);
-	//sgbmResult.ShowDisparity();
+	const std::vector<BackendRun> runs = {
+		{ DenseStereoBackend::OpenCv, "opencv", "OpenCV StereoSGBM (+WLS)" },
+		{ DenseStereoBackend::Custom, "custom", "Custom NCC block matcher" },
+	};
 
-	// Write raw disparity map
-	cv::imwrite((outputDir / "disparity_float.tiff").string(), sgbmResult.rawDisparity);
-	cv::imwrite((outputDir / "valid_disparity_mask.tiff").string(), sgbmResult.validDisparityMask);
-
-	// Step output: colored disparity map.
-	cv::Mat disparityColored;
-	cv::applyColorMap(sgbmResult.disparityVisualization, disparityColored, cv::COLORMAP_JET);
-	disparityColored.setTo(cv::Scalar(0, 0, 0), ~sgbmResult.validDisparityMask);
-	cv::imwrite((outputDir / "disparity_colored.png").string(), disparityColored);
-
-	// Final stage: disparity -> depth -> colored point cloud + mesh.
 	DepthReconstructor depthReconstructor;
-	DepthReconstructionConfig depthConfig;
-	depthConfig.metricBaseline = 1.0; // up to scale; set to the real ETH3D baseline (m) for metric depth
-	// maxDepth left at 0: DepthReconstructor clips far outliers at maxDepthPercentile
-	// (scene-adaptive). Set depthConfig.maxDepth explicitly to override.
 
-	ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, sgbmResult, depthConfig);
-	reconstruction.WriteDepthMapTiff(outputDir);
-	reconstruction.PrintStats();
+	for (const BackendRun& run : runs)
+	{
+		std::cout << "\n==================== Dense backend: " << run.label
+			<< " (tag '" << run.tag << "') ====================" << std::endl;
 
-	if (reconstruction.ValidPointCount() > 0)
-	{
-		reconstruction.WritePointCloudPly(outputDir / "pointcloud.ply");
-		reconstruction.WriteMeshPly(outputDir / "mesh.ply", depthConfig.maxMeshEdgeDepthDiff);
-	}
-	else
-	{
-		std::cout << "No valid 3D points were reconstructed; skipping point cloud and mesh export." << std::endl;
+		DenseStereoConfig denseConfig;
+		denseConfig.backend = run.backend;
+		denseConfig.method = DenseStereoMethod::StereoSGBM; // used only by the OpenCV backend
+
+		std::unique_ptr<IDenseStereoMatcher> matcher = CreateDenseMatcher(run.backend);
+		DenseMatchingResult denseResult = matcher->ComputeDisparity(rectResult, denseConfig);
+
+		// Disparity outputs (tagged per backend).
+		cv::imwrite((outputDir / ("disparity_" + run.tag + "_float.tiff")).string(), denseResult.rawDisparity);
+		cv::imwrite((outputDir / ("valid_disparity_" + run.tag + "_mask.tiff")).string(), denseResult.validDisparityMask);
+
+		cv::Mat disparityColored;
+		cv::applyColorMap(denseResult.disparityVisualization, disparityColored, cv::COLORMAP_JET);
+		disparityColored.setTo(cv::Scalar(0, 0, 0), ~denseResult.validDisparityMask);
+		cv::imwrite((outputDir / ("disparity_" + run.tag + "_colored.png")).string(), disparityColored);
+
+		// Depth -> colored point cloud + mesh (identical tail for both backends).
+		DepthReconstructionConfig depthConfig;
+		depthConfig.metricBaseline = 1.0; // up to scale; set the real ETH3D baseline (m) for metric depth
+		// maxDepth left at 0: DepthReconstructor clips far outliers at maxDepthPercentile
+		// (scene-adaptive). Set depthConfig.maxDepth explicitly to override.
+
+		ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, denseResult, depthConfig);
+		reconstruction.WriteDepthMapTiff(outputDir, run.tag);
+		reconstruction.PrintStats();
+
+		if (reconstruction.ValidPointCount() > 0)
+		{
+			reconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + run.tag + ".ply"));
+			reconstruction.WriteMeshPly(outputDir / ("mesh_" + run.tag + ".ply"), depthConfig.maxMeshEdgeDepthDiff);
+		}
+		else
+		{
+			std::cout << "No valid 3D points were reconstructed for backend '" << run.tag
+				<< "'; skipping point cloud and mesh export." << std::endl;
+		}
 	}
 
 	return 0;
