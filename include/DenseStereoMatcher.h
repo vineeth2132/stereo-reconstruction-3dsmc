@@ -34,7 +34,9 @@ struct DenseStereoConfig
 
 	int minDisparity = 0;
 	int numDisparities = 320;
-	int blockSize = 7;
+	// 5 gives the sharpest result on delivery_area with WLS on; larger windows
+	// over-smooth (note p1/p2 derive from blockSize^2, so they grow too).
+	int blockSize = 5;
 
 	// StereoSGBM smoothness penalties (0 = derive from blockSize: 8*bs^2 / 32*bs^2).
 	int p1 = 0;

@@ -13,6 +13,16 @@ namespace
 	{
 		return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 	}
+
+	// Writes one binary PLY vertex: 3 little-endian floats (x, y, z) followed by
+	// 3 bytes of color. Input color is BGR (OpenCV); PLY expects RGB.
+	void WritePlyVertex(std::ofstream& file, const cv::Vec3f& point, const cv::Vec3b& bgr)
+	{
+		const float xyz[3] = { point[0], point[1], point[2] };
+		file.write(reinterpret_cast<const char*>(xyz), sizeof(xyz));
+		const unsigned char rgb[3] = { bgr[2], bgr[1], bgr[0] };
+		file.write(reinterpret_cast<const char*>(rgb), sizeof(rgb));
+	}
 }
 
 int ReconstructionResult::ValidPointCount() const
@@ -220,13 +230,15 @@ void ReconstructionResult::WritePointCloudPly(const std::filesystem::path& outpu
 
 	std::filesystem::create_directories(outputPath.parent_path());
 
-	std::ofstream file(outputPath);
+	// Binary little-endian PLY: ~10x smaller than ASCII and far faster for viewers
+	// like MeshLab to load (large ASCII clouds can exhaust memory / crash).
+	std::ofstream file(outputPath, std::ios::binary);
 	if (!file.is_open()) { throw std::runtime_error("Failed to open output file: " + outputPath.string()); }
 
 	const int vertexCount = ValidPointCount();
 
 	file << "ply\n";
-	file << "format ascii 1.0\n";
+	file << "format binary_little_endian 1.0\n";
 	file << "element vertex " << vertexCount << "\n";
 	file << "property float x\nproperty float y\nproperty float z\n";
 	file << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
@@ -241,8 +253,7 @@ void ReconstructionResult::WritePointCloudPly(const std::filesystem::path& outpu
 			const cv::Vec3f point = points3D.at<cv::Vec3f>(row, col);
 			const cv::Vec3b color = colors.at<cv::Vec3b>(row, col); // BGR
 
-			file << point[0] << ' ' << point[1] << ' ' << point[2] << ' '
-				<< static_cast<int>(color[2]) << ' ' << static_cast<int>(color[1]) << ' ' << static_cast<int>(color[0]) << '\n';
+			WritePlyVertex(file, point, color);
 		}
 	}
 
@@ -312,11 +323,13 @@ void ReconstructionResult::WriteMeshPly(const std::filesystem::path& outputPath,
 
 	std::filesystem::create_directories(outputPath.parent_path());
 
-	std::ofstream file(outputPath);
+	// Binary little-endian PLY (see WritePointCloudPly): dense meshes are tens of
+	// millions of faces, where ASCII reaches ~1 GB and crashes MeshLab on load.
+	std::ofstream file(outputPath, std::ios::binary);
 	if (!file.is_open()) { throw std::runtime_error("Failed to open output file: " + outputPath.string()); }
 
 	file << "ply\n";
-	file << "format ascii 1.0\n";
+	file << "format binary_little_endian 1.0\n";
 	file << "element vertex " << nextIndex << "\n";
 	file << "property float x\nproperty float y\nproperty float z\n";
 	file << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
@@ -333,14 +346,16 @@ void ReconstructionResult::WriteMeshPly(const std::filesystem::path& outputPath,
 			const cv::Vec3f point = points3D.at<cv::Vec3f>(row, col);
 			const cv::Vec3b color = colors.at<cv::Vec3b>(row, col); // BGR
 
-			file << point[0] << ' ' << point[1] << ' ' << point[2] << ' '
-				<< static_cast<int>(color[2]) << ' ' << static_cast<int>(color[1]) << ' ' << static_cast<int>(color[0]) << '\n';
+			WritePlyVertex(file, point, color);
 		}
 	}
 
 	for (const std::array<int, 3>& face : faces)
 	{
-		file << "3 " << face[0] << ' ' << face[1] << ' ' << face[2] << '\n';
+		const unsigned char vertsPerFace = 3;
+		file.write(reinterpret_cast<const char*>(&vertsPerFace), sizeof(vertsPerFace));
+		const int indices[3] = { face[0], face[1], face[2] };
+		file.write(reinterpret_cast<const char*>(indices), sizeof(indices));
 	}
 
 	std::cout << "Mesh written to " << outputPath.string() << " (" << nextIndex << " vertices, " << faces.size() << " faces)." << std::endl;
