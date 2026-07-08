@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
+import cv2
 import matplotlib
 matplotlib.use("Agg")  # file output only, no display
 import matplotlib.pyplot as plt
@@ -79,14 +80,29 @@ def load_pred(out_dir: Path, tag: str) -> np.ndarray | None:
 def evaluate(pred: np.ndarray, gt: np.ndarray) -> dict | None:
     """Compute error metrics over the pixels valid in both maps. Returns None if
     there is no overlap."""
-    both = np.isfinite(pred) & np.isfinite(gt)
+
+    # RAFT may be evaluated at a lower resolution than the C++ outputs.
+    # Resize GT to prediction resolution so the same evaluator can handle RAFT.
+    if pred.shape != gt.shape:
+        gt_eval = cv2.resize(
+            gt.astype(np.float32),
+            (pred.shape[1], pred.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+        gt_eval[~np.isfinite(gt_eval)] = np.nan
+        gt_eval[gt_eval <= 0.0] = np.nan
+    else:
+        gt_eval = gt
+
+    both = np.isfinite(pred) & np.isfinite(gt_eval)
     count = int(both.sum())
-    gt_valid = int(np.isfinite(gt).sum())
+    gt_valid = int(np.isfinite(gt_eval).sum())
+
     if count == 0:
         return None
 
     p = pred[both].astype(np.float64)
-    g = gt[both].astype(np.float64)
+    g = gt_eval[both].astype(np.float64)
     err = p - g
     abs_err = np.abs(err)
 
@@ -105,8 +121,10 @@ def evaluate(pred: np.ndarray, gt: np.ndarray) -> dict | None:
         "scale": scale,
         "mae_scaled": float(abs_err_scaled.mean()),
     }
+
     for t in BAD_THRESHOLDS:
         metrics[f"bad_{t}"] = float((abs_err > t).mean())
+
     return metrics
 
 
@@ -141,17 +159,36 @@ def print_table(results: dict[str, dict]) -> None:
 def render_error_maps(pred_maps: dict[str, np.ndarray], gt: np.ndarray, out_dir: Path) -> None:
     """Save one absolute-error map per tag (white = invalid), sharing a single color
     scale with a 99th-percentile vmax so the backends are visually comparable."""
+
     error_maps: dict[str, np.ndarray] = {}
+
     for tag, pred in pred_maps.items():
-        both = np.isfinite(pred) & np.isfinite(gt)
+        if pred.shape != gt.shape:
+            gt_eval = cv2.resize(
+                gt.astype(np.float32),
+                (pred.shape[1], pred.shape[0]),
+                interpolation=cv2.INTER_NEAREST
+            )
+            gt_eval[~np.isfinite(gt_eval)] = np.nan
+            gt_eval[gt_eval <= 0.0] = np.nan
+        else:
+            gt_eval = gt
+
+        both = np.isfinite(pred) & np.isfinite(gt_eval)
+
         err = np.full(pred.shape, np.nan, dtype=np.float32)
-        err[both] = np.abs(pred[both] - gt[both])
+        err[both] = np.abs(pred[both] - gt_eval[both])
         error_maps[tag] = err
 
-    finite = np.concatenate([e[np.isfinite(e)].ravel() for e in error_maps.values()])
-    if finite.size == 0:
+    finite_parts = [e[np.isfinite(e)].ravel() for e in error_maps.values()]
+
+    finite_parts = [x for x in finite_parts if x.size > 0]
+
+    if not finite_parts:
         print("  no overlapping pixels to render error maps")
         return
+
+    finite = np.concatenate(finite_parts)
     vmax = float(np.percentile(finite, 99))
 
     cmap = plt.get_cmap("turbo").copy()
