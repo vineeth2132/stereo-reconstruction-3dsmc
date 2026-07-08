@@ -57,3 +57,11 @@ data/delivery_area/images/
 *.JPG
 *.jpg
 *.png
+
+third_party/
+out_dl/
+.venv-raft/
+.venv-dust3r/
+*.pth
+*.pt
+*.ckpt
