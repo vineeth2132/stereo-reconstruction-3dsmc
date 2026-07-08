@@ -207,6 +207,7 @@ def render_error_maps(pred_maps: dict[str, np.ndarray], gt: np.ndarray, out_dir:
         fig.savefig(dest, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"  wrote {dest.name}")
+        
 
 
 def main() -> None:
