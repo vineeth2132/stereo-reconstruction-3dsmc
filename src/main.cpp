@@ -134,6 +134,19 @@ int main()
 		cv::imwrite((outputDir / ("disparity_" + run.tag + "_float.tiff")).string(), denseResult.rawDisparity);
 		cv::imwrite((outputDir / ("valid_disparity_" + run.tag + "_mask.tiff")).string(), denseResult.validDisparityMask);
 
+		// Custom-backend diagnostics: the pre-fill matched mask (honest, fill-free
+		// coverage) and the pre-fill failure-reason map (raw indexed 0..4 PNG that
+		// scripts/evaluate_depth.py colors and tabulates). Only the custom backend
+		// populates these, so guard on non-empty.
+		if (!denseResult.matchedMask.empty())
+		{
+			cv::imwrite((outputDir / ("valid_matched_" + run.tag + "_mask.tiff")).string(), denseResult.matchedMask);
+		}
+		if (!denseResult.failureReason.empty())
+		{
+			cv::imwrite((outputDir / ("reason_" + run.tag + ".png")).string(), denseResult.failureReason);
+		}
+
 		cv::Mat disparityColored;
 		cv::applyColorMap(denseResult.disparityVisualization, disparityColored, cv::COLORMAP_JET);
 		disparityColored.setTo(cv::Scalar(0, 0, 0), ~denseResult.validDisparityMask);
@@ -157,6 +170,49 @@ int main()
 		{
 			reconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + run.tag + ".ply"), depthConfig.exportGridStep);
 			reconstruction.WriteMeshPly(outputDir / ("mesh_" + run.tag + ".ply"), depthConfig.maxMeshEdgeDepthDiff, depthConfig.exportGridStep);
+
+			/*
+				Custom backend only: also export the fill-free "matched-only" variant.
+				~60% of the dense map's valid pixels are directional-fill interpolations
+				(smooth, no fine detail); denseResult.matchedMask marks the ~36% that were
+				genuinely matched. Restricting the reconstruction to (validMask AND
+				matchedMask) gives a crisp point cloud / mesh that surfaces the honest
+				geometry alongside the dense fill. Only validMask differs, so a shallow
+				copy of the result (sharing points3D/colors) is the least invasive path.
+			*/
+			if (run.backend == DenseStereoBackend::Custom && !denseResult.matchedMask.empty())
+			{
+				ReconstructionResult matchedReconstruction = reconstruction; // shares points3D/colors; validMask replaced below
+				cv::bitwise_and(reconstruction.validMask, denseResult.matchedMask, matchedReconstruction.validMask);
+
+				if (matchedReconstruction.ValidPointCount() > 0)
+				{
+					/*
+						Reuse the exact discontinuity threshold the dense mesh derived
+						(0.02 * meanZ over its valid strided vertices, see WriteMeshPly) so the
+						two meshes are directly comparable. Deriving it inside WriteMeshPly from
+						the matched-only subset would use a slightly different meanZ.
+					*/
+					const int stride = std::max(1, depthConfig.exportGridStep);
+					double sumZ = 0.0;
+					int meshVertexCount = 0;
+					for (int row = 0; row < reconstruction.points3D.rows; row += stride)
+					{
+						for (int col = 0; col < reconstruction.points3D.cols; col += stride)
+						{
+							if (reconstruction.validMask.at<unsigned char>(row, col) == 0) { continue; }
+							sumZ += reconstruction.points3D.at<cv::Vec3f>(row, col)[2];
+							++meshVertexCount;
+						}
+					}
+					const float denseMeshEdgeDepthDiff = meshVertexCount > 0
+						? 0.02f * static_cast<float>(sumZ / meshVertexCount)
+						: depthConfig.maxMeshEdgeDepthDiff;
+
+					matchedReconstruction.WritePointCloudPly(outputDir / "pointcloud_custom_matched.ply", depthConfig.exportGridStep);
+					matchedReconstruction.WriteMeshPly(outputDir / "mesh_custom_matched.ply", denseMeshEdgeDepthDiff, depthConfig.exportGridStep);
+				}
+			}
 		}
 		else
 		{

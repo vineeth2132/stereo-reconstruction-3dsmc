@@ -11,7 +11,9 @@ This script mirrors the MATLAB helpers (imagesc + colorbar, NaN shown white) and
 produces, for the report:
 
     out/disparity_<tag>_scaled.png   out/depth_<tag>_scaled.png
-    out/comparison_disparity.png     out/comparison_depth.png   (opencv vs custom)
+    out/disparity_custom_matched_scaled.png  (custom map masked to matched pixels)
+    out/comparison_disparity.png     out/comparison_depth.png
+        (opencv | custom dense, filled | custom matched-only | ground truth)
 
 Run with the project venv:
 
@@ -55,6 +57,27 @@ def load_map(out_dir: Path, kind: str, tag: str) -> np.ndarray | None:
     return out
 
 
+def load_matched_mask(out_dir: Path) -> np.ndarray | None:
+    """Load the custom matcher's pre-fill matched mask
+    (out/valid_matched_custom_mask.tiff) as a boolean array (True = genuinely
+    matched). Returns None if the file is missing."""
+    path = out_dir / "valid_matched_custom_mask.tiff"
+    if not path.exists():
+        return None
+    return tifffile.imread(path) > 0
+
+
+def apply_matched_mask(data: np.ndarray, matched: np.ndarray) -> np.ndarray | None:
+    """Restrict a custom map to genuinely-matched pixels: NaN everywhere the matched
+    mask is False (rendered white, like the other invalid pixels). Returns None if
+    the shapes disagree (e.g. mask for a different resolution)."""
+    if matched.shape != data.shape:
+        return None
+    out = data.copy()
+    out[~matched] = np.nan
+    return out
+
+
 def load_gt_depth(out_dir: Path) -> np.ndarray | None:
     """Load the rectified GT depth (metric meters) as a float array with NaN at
     invalid pixels. Invalid GT is encoded as NaN or non-positive depth (mirrors
@@ -92,16 +115,24 @@ def render_single(data: np.ndarray, title: str, cbar_label: str, dest: Path) -> 
 
 def render_comparison(maps: dict[str, np.ndarray], kind: str, cbar_label: str, dest: Path,
                       gt: np.ndarray | None = None,
-                      gt_title: str = "Ground truth (laser)") -> None:
+                      gt_title: str = "Ground truth (laser)",
+                      matched: np.ndarray | None = None) -> None:
     """Side-by-side panels sharing one color scale, so the backends are comparable.
-    When ``gt`` is provided it is appended as an extra panel; the shared scale spans
-    every panel (backends + GT)."""
+    When ``matched`` is provided (the custom map masked to genuinely-matched pixels)
+    it is inserted right after the custom (dense, filled) panel. When ``gt`` is
+    provided it is appended as the final panel; the shared scale spans every panel."""
     tags = [t for t in ("opencv", "custom") if t in maps]
     if not tags:
         return
 
-    # Ordered panels: backends first, then the ground-truth reference if available.
-    panels: list[tuple[str, np.ndarray]] = [(f"{kind} — {tag}", maps[tag]) for tag in tags]
+    # Ordered panels: opencv | custom (dense, filled) | custom (matched only) | GT.
+    panels: list[tuple[str, np.ndarray]] = []
+    for tag in tags:
+        title = f"{kind} — custom (dense, filled)" if tag == "custom" else f"{kind} — {tag}"
+        panels.append((title, maps[tag]))
+        # Slot the fill-free matched-only variant right after the dense custom panel.
+        if tag == "custom" and matched is not None:
+            panels.append((f"{kind} — custom matched-only", matched))
     if gt is not None:
         panels.append((gt_title, gt))
 
@@ -150,7 +181,12 @@ def main() -> None:
     gt_depth = load_gt_depth(out_dir)
     if gt_depth is None:
         print("note: gt_depth_rectified_float.tiff not found — "
-              "comparison figures fall back to 2 panels (opencv | custom)")
+              "comparison figures fall back to fewer panels (no GT panel)")
+
+    matched_mask = load_matched_mask(out_dir)
+    if matched_mask is None:
+        print("note: valid_matched_custom_mask.tiff not found — "
+              "comparison figures skip the custom matched-only panel")
 
     for kind, cbar_label in specs:
         print(f"{kind}:")
@@ -162,6 +198,17 @@ def main() -> None:
             loaded[tag] = data
             title = f"{kind.capitalize()} map — {tag} (white = invalid)"
             render_single(data, title, cbar_label, out_dir / f"{kind}_{tag}_scaled.png")
+
+        # Custom matched-only variant: the custom map masked to genuinely-matched
+        # pixels (fill-free). Rendered as its own single and, below, as a comparison
+        # panel. Skipped gracefully when the mask or custom map is unavailable.
+        matched_panel: np.ndarray | None = None
+        if matched_mask is not None and "custom" in loaded:
+            matched_panel = apply_matched_mask(loaded["custom"], matched_mask)
+            if matched_panel is not None:
+                title = f"{kind.capitalize()} map — custom matched-only (white = invalid)"
+                render_single(matched_panel, title, cbar_label,
+                              out_dir / f"{kind}_custom_matched_scaled.png")
 
         # Build the ground-truth panel for this kind (None -> 2-panel fallback).
         gt_panel: np.ndarray | None = None
@@ -184,7 +231,7 @@ def main() -> None:
 
         if len(loaded) >= 2:
             render_comparison(loaded, kind, cbar_label, out_dir / f"comparison_{kind}.png",
-                              gt=gt_panel)
+                              gt=gt_panel, matched=matched_panel)
 
 
 if __name__ == "__main__":

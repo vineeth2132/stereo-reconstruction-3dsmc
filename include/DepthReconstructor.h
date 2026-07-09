@@ -45,8 +45,12 @@ struct DepthReconstructionConfig
 		When maxDepth is 0, clip everything above this percentile of the valid
 		depths instead - a scene-adaptive way to drop far outliers that keeps the
 		mesh viewable without hand-tuning. Set to 0 to disable clipping entirely.
+		99.9 (not 98): with the dense filled disparity the far tail is real
+		background, and depth is already bounded by fB / min(disparity) (~28 m on
+		delivery_area), so an aggressive clip only deletes genuine geometry -- at
+		98 it cut GT-verified pixels between 15.3 m and 18.3 m.
 	*/
-	float maxDepthPercentile = 98.0f;
+	float maxDepthPercentile = 99.9f;
 
 	// Mesh: skip triangles whose vertices differ in depth by more than this
 	// (suppresses stretched faces across occlusion/depth boundaries).
