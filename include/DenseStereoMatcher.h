@@ -133,6 +133,84 @@ struct DenseStereoConfig
 	// Maximum |disparity difference| (working px) for two neighbours to belong to
 	// the same speckle component.
 	float customSpeckleTolerance = 1.0f;
+
+	// --- Occlusion-aware densification (SGM-style fill + refinement) -------------
+	// After the speckle filter the matched map is accurate but sparse. These knobs
+	// enable a discontinuity-preserving directional fill of the holes (Hirschmuller
+	// interpolation rule) followed by an edge-aware weighted-median smoothing of the
+	// filled pixels only, so coverage rises without disturbing matched geometry.
+
+	// Occlusion-aware hole filling after the speckle filter. Off leaves the sparse
+	// matched-only map.
+	bool customFillHoles = true;
+
+	// A hole pixel is only filled when a valid disparity is reachable in at least
+	// this many of the 8 scan directions. Keeps genuinely unobserved border strips
+	// (the left edge is never seen in the right view) unfilled instead of
+	// extrapolating geometry across the whole image. 5 (not 6) because the left
+	// no-correspondence band -- ~20% of the GT region -- has exactly 5 of the 8
+	// directions available; 6 would leave it permanently unfilled.
+	int customFillMinDirections = 5;
+
+	// --- Guided diffusion of mismatch-type fills --------------------------------
+	// FillHolesDirectional plants a single directional value across a whole hole
+	// interior; the weighted median below only corrects it within ~radius px of the
+	// hole rim, so large blob interiors (~100+ working px half-width on delivery_area)
+	// keep a wrong constant depth. This stage runs BETWEEN the directional fill and
+	// the weighted median: a Jacobi guide-weighted normalized convolution that relaxes
+	// the mismatch fills (reason 1/2/4) toward the surrounding real measurements, while
+	// matched pixels (reason 0) and occlusion-background fills (reason 3) stay fixed as
+	// anchors. Implemented as box filters over a quantized guide (no per-neighbour exp).
+
+	// Jacobi iterations of the guided diffusion. 0 disables the stage. Each iteration
+	// propagates information ~radius px, so iterations * radius must exceed the largest
+	// hole half-width (~100+ working px) for blob interiors to be reached; 24 * 6 = 144.
+	// SHIPPED OFF (0): measured on delivery_area the stage worsened the dense row on every
+	// metric (MAE 0.220 -> 0.362 m, bad>0.5m 7.3% -> 12.9%). In textureless holes the guide
+	// has no edges, so the diffusion degenerates to plain averaging and smears depth across
+	// discontinuities that carry no image edge, where the directional-fill median was safer.
+	int customGuidedFillIterations = 0;
+
+	// Half-window (working px) of the diffusion's normalized-convolution kernel. Larger
+	// reaches deeper per iteration but costs a bigger box filter; 6 balances the two so
+	// 24 iterations span the largest interiors.
+	int customGuidedFillRadius = 6;
+
+	// Intensity sigma (0..255 gray levels) for the guide weights w = exp(-dI^2/2sigma^2):
+	// neighbours within ~sigma of the centre intensity dominate, so disparity diffuses
+	// along the left image's edges instead of bleeding across them.
+	float customGuidedFillSigmaColor = 10.0f;
+
+	// Half-window of the edge-aware weighted median applied to FILLED pixels only,
+	// guided by the left rectified image. 0 disables the refinement.
+	int customWeightedMedianRadius = 9;
+
+	// Intensity sigma (0..255 gray levels) for the guidance weights: neighbours
+	// whose guide intensity is within ~sigma of the centre dominate the weighted
+	// median, so the fill follows image edges instead of crossing them.
+	float customWeightedMedianSigmaColor = 10.0f;
+
+	// Weighted-median passes over the filled pixels. Repeats let edges propagate
+	// deeper into large filled regions. With the guided diffusion above already
+	// relaxing blob interiors, this only has to clean up the rim, so 2 passes at
+	// radius 9 suffice (a 12/3 probe showed no measurable gain).
+	int customWeightedMedianIterations = 2;
+};
+
+/*
+	Pre-fill failure-reason codes recorded by the custom matcher in
+	DenseMatchingResult::failureReason (CV_8U, full resolution). Kept as small
+	integer constants so they survive a raw indexed-PNG round-trip for the Python
+	diagnostics. "Pre-fill" means these describe why a pixel was invalid before the
+	occlusion-aware hole filling; a filled pixel keeps its original non-zero cause.
+*/
+enum CustomMatchReason : unsigned char
+{
+	CustomMatchReasonMatched = 0,      // confident match kept through all gates
+	CustomMatchReasonNeverMatched = 1, // low correlation / no pyramid match
+	CustomMatchReasonBorder = 2,       // incomplete window / out-of-image search span
+	CustomMatchReasonLrRejected = 3,   // rejected by the left-right consistency check
+	CustomMatchReasonSpeckle = 4       // removed by the speckle filter
 };
 
 struct DenseMatchingResult
@@ -140,6 +218,10 @@ struct DenseMatchingResult
 	cv::Mat rawDisparity;
 	cv::Mat disparityVisualization;
 	cv::Mat validDisparityMask;
+
+	// Diagnostics, populated only by the custom backend (empty otherwise).
+	cv::Mat matchedMask;   // CV_8U full-res: pixels genuinely matched, before hole filling.
+	cv::Mat failureReason; // CV_8U full-res: pre-fill cause codes (see CustomMatchReason).
 
 	// for debugging
 	void ShowDisparity() const;

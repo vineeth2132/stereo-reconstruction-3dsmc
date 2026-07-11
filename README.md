@@ -214,8 +214,12 @@ Running the executable writes the following step outputs to `out/`. The dense an
 | `depth_<tag>_float.tiff`, `valid_depth_<tag>_mask.tiff` | Per-pixel depth (Z) + mask |
 | `pointcloud_<tag>.ply` | Colored 3D point cloud |
 | `mesh_<tag>.ply` | Triangle mesh from the disparity grid |
+| `valid_matched_custom_mask.tiff` | Custom backend only: the pre-fill matched mask (honest, fill-free coverage; the ~36% of valid pixels that were genuinely matched vs. directionally filled) |
+| `reason_custom.png` | Custom backend only: raw indexed 0..4 pre-fill failure-reason map (see `CustomMatchReason`; colored/tabulated by `evaluate_depth.py`) |
+| `pointcloud_custom_matched.ply`, `mesh_custom_matched.ply` | Custom matched-only 3D outputs — the reconstruction restricted to `validMask ∧ matchedMask` (fill-free, crisp; smaller than the dense `*_custom.ply`) |
 | `disparity_<tag>_scaled.png`, `depth_<tag>_scaled.png` | Color-scaled map with colorbar, **white = invalid** (from `visualize_maps.py`) |
-| `comparison_disparity.png`, `comparison_depth.png` | OpenCV-vs-custom side-by-side, shared color scale (from `visualize_maps.py`) |
+| `disparity_custom_matched_scaled.png` | Custom disparity masked to matched-only pixels, same color scale (from `visualize_maps.py`) |
+| `comparison_disparity.png`, `comparison_depth.png` | Four-panel side-by-side (opencv \| custom dense, filled \| custom matched-only \| ground truth), shared color scale; panels degrade gracefully if the GT or matched mask is missing (from `visualize_maps.py`) |
 | `gt_depth_raw_float.tiff`, `gt_depth_rectified_float.tiff` | ETH3D ground-truth depth (raw + rectified into the disparity frame), written only when the GT data is present |
 | `error_<tag>_scaled.png` | Absolute depth-error map vs. rectified GT, shared color scale, white = invalid (from `evaluate_depth.py`) |
 
@@ -256,14 +260,25 @@ the pipeline still runs without it), and the same venv packages as
 .venv\Scripts\python.exe scripts\evaluate_depth.py
 ```
 
-On `delivery_area` (metric baseline 0.4289 m recovered from `images.txt`) the custom
-depth backend beats tuned OpenCV SGBM:
+On `delivery_area` (metric baseline 0.4289 m recovered from `images.txt`), coverage is
+reported as a fraction of the GT-valid region. The custom backend is reported in two
+variants: **dense** (after occlusion-aware hole filling — high coverage, but ~60% of its
+valid pixels are directional-fill interpolations) and **matched-only** (the fill-free
+subset the matcher genuinely matched — lower coverage but much more accurate):
 
-| Metric | OpenCV (tuned) | Custom |
-|--------|---------------:|-------:|
-| MAE | 0.079 m | **0.040 m** |
-| bad > 0.1 m | 19.4% | **8.5%** |
-| coverage | 31.5% | **35.4%** |
+| Metric | OpenCV (tuned) | Custom (dense) | Custom (matched-only) |
+|--------|---------------:|---------------:|----------------------:|
+| coverage | 31.7% | **91.9%** | 36.3% |
+| MAE | 0.0858 m | 0.2243 m | **0.0397 m** |
+| median AE | — | 0.0304 m | **0.0179 m** |
+| bad > 0.5 m | — | 7.6% | — |
+| bad > 2 px | — | 27.8% | **7.1%** |
+
+The dense fill trades accuracy for coverage: it fills the textureless floor and occluded
+strips so the map is continuous, but those filled pixels drag the MAE up. The matched-only
+row is the honest measurement of the matcher itself and beats tuned OpenCV SGBM on every
+shared metric. Coverage tops out around ~92% because the left/right image bands are never
+seen by the second camera, so no amount of filling can recover them.
 
 ## Dense matching backends
 
@@ -305,6 +320,41 @@ our own connected-component speckle filter (`customSpeckleMinArea`,
 `customMinCorrelation`, `customSubpixel`, `customMedianKernel`,
 `customSpeckleMinArea`, `customSpeckleTolerance`) live in `DenseStereoConfig`.
 
+### Occlusion-aware densification
+
+The speckle-filtered map is accurate but sparse (~36% of the GT region). A three-stage
+densification pass then fills the holes without disturbing the genuinely matched pixels:
+
+1. **`FillHolesDirectional`** (`customFillHoles`) — an SGM-style directional fill. For
+   each hole pixel it scans the 8 compass directions for the nearest valid disparity;
+   when the failure reason is an LR-occlusion it takes the **second-smallest** of the
+   directional candidates (Hirschmüller's occlusion rule — occlusions belong to the
+   background, so the smallest/nearest value is skipped), otherwise the **median**. A
+   pixel is only filled when a valid disparity is reachable in at least
+   `customFillMinDirections = 5` of the 8 directions: the left no-correspondence band
+   (~20% of the GT region) has exactly 5 directions available, so 5 fills it while 6
+   would leave it (and other genuinely-unobserved strips) permanently blank.
+2. **`GuidedDiffusionRefine`** (`customGuidedFillIterations`) — **ships disabled (0)**.
+   It relaxed mismatch-type fills toward the surrounding measurements via a guide-weighted
+   normalized convolution, but in textureless holes the guide has no image edges, so it
+   degenerated to plain averaging and smeared depth across discontinuities that carry no
+   edge (MAE 0.220 → 0.362 m on `delivery_area`). Kept as an ablation, off by default.
+3. **`WeightedMedianRefine`** (`customWeightedMedianRadius = 9`,
+   `customWeightedMedianIterations = 2`) — an edge-aware weighted median applied to the
+   **filled pixels only**, guided by the rectified left image so the fill follows image
+   edges instead of crossing them. Two passes at radius 9 propagate edges into the filled
+   regions; matched pixels are left untouched.
+
+The densification produces the **dense** map. To keep the interpolated fills honest, the
+matcher also records, before filling, `matchedMask` (the genuinely-matched pixels) and
+`failureReason` (per-pixel `CustomMatchReason` codes: matched / never-matched / border /
+LR-rejected / speckle). `main` writes these as `valid_matched_custom_mask.tiff` and
+`reason_custom.png`, and — for the custom backend — additionally exports the fill-free
+**matched-only** 3D outputs (`pointcloud_custom_matched.ply`, `mesh_custom_matched.ply`)
+by restricting the reconstruction to `validMask ∧ matchedMask`. `visualize_maps.py` renders
+a matched-only comparison panel next to the dense and GT panels so the two can be judged
+side by side, and `evaluate_depth.py` reports a separate `custom-matched` row.
+
 ## Depth reconstruction (`DepthReconstructor`)
 
 `DepthReconstructor` turns the disparity map into 3D geometry:
@@ -321,17 +371,22 @@ our own connected-component speckle filter (`customSpeckleMinArea`,
   Set `DepthReconstructionConfig::metricBaseline` to the real baseline (in meters,
   computable from the ETH3D `images.txt` poses) for metric depth.
 * Auto-orients the cloud so depth is positive (handles left/right-swapped inputs).
-* Clips far outliers at `maxDepthPercentile` (default 98th percentile) so the mesh
+* Clips far outliers at `maxDepthPercentile` (default 99.9th percentile) so the mesh
   stays viewable without a hand-tuned absolute `maxDepth`. The reconstruction is
   only up to scale, so an absolute limit is arbitrary and drifts between runs; the
-  percentile adapts automatically. Set an explicit `maxDepth` to override.
+  percentile adapts automatically. The default was 98 but that clipped real far
+  geometry (with the dense filled disparity the far tail is genuine background, and
+  depth is already bounded by `fB / min(disparity)` ≈ 28 m on `delivery_area`); 98
+  cut GT-verified pixels between 15.3 m and 18.3 m, so it was raised to 99.9. Set an
+  explicit `maxDepth` to override.
 * Exports a colored point cloud and a triangle mesh (neighboring valid pixels are
   triangulated; quads spanning a depth discontinuity are skipped to avoid stretched
   faces). The `.ply` files are written as **binary little-endian**, and
   `exportGridStep` (default 2 in `main`) strides the point-cloud/mesh grid — since
-  the custom matcher runs at 0.5 scale, step 2 is effectively lossless and keeps
-  `mesh_custom.ply` around ~64 MB instead of the >500 MB an ASCII full-grid export
-  would produce. Poisson meshing can be added later.
+  the custom matcher runs at 0.5 scale, step 2 is effectively lossless and keeps the
+  dense `mesh_custom.ply` around ~220 MB (the fill-free `mesh_custom_matched.ply` is
+  ~67 MB) instead of the multi-GB an ASCII full-grid export would produce. Poisson
+  meshing can be added later.
 
 ## Custom Geometry Implementation
 

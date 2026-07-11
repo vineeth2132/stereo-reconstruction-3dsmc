@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace
@@ -367,6 +368,401 @@ namespace
 
 		std::cout << "Custom matcher: speckle filter removed " << removed << " pixels." << std::endl;
 	}
+
+	/*
+		For every pixel, the nearest valid disparity encountered when walking in the
+		direction (stepX, stepY), computed in a single O(N) sweep. The recurrence
+		R(p) = valid(p) ? d(p) : R(p + step) is evaluated by visiting p + step before
+		p (loop bounds are ordered against the step), so one pass fills a whole
+		scanline family. Pixels that never see a valid value hold the invalid
+		sentinel. This is the linear-propagation primitive the directional fill uses.
+	*/
+	cv::Mat PropagateNearestValid(const cv::Mat& disparity, const cv::Mat& validMask, int stepX, int stepY)
+	{
+		const int rows = disparity.rows;
+		const int cols = disparity.cols;
+		cv::Mat nearest(disparity.size(), CV_32F, cv::Scalar(kInvalidDisparity));
+
+		// Visit p + step before p: iterate descending along an axis whose step is
+		// positive, ascending otherwise. A zero step direction may go either way.
+		const int rowStart = stepY > 0 ? rows - 1 : 0;
+		const int rowEnd = stepY > 0 ? -1 : rows;
+		const int rowInc = stepY > 0 ? -1 : 1;
+		const int colStart = stepX > 0 ? cols - 1 : 0;
+		const int colEnd = stepX > 0 ? -1 : cols;
+		const int colInc = stepX > 0 ? -1 : 1;
+
+		for (int row = rowStart; row != rowEnd; row += rowInc)
+		{
+			const uchar* maskRow = validMask.ptr<uchar>(row);
+			const float* dispRow = disparity.ptr<float>(row);
+			float* outRow = nearest.ptr<float>(row);
+			for (int col = colStart; col != colEnd; col += colInc)
+			{
+				if (maskRow[col] != 0)
+				{
+					outRow[col] = dispRow[col];
+					continue;
+				}
+				const int nr = row + stepY;
+				const int nc = col + stepX;
+				if (nr >= 0 && nr < rows && nc >= 0 && nc < cols)
+				{
+					outRow[col] = nearest.at<float>(nr, nc); // p + step is already computed
+				}
+			}
+		}
+		return nearest;
+	}
+
+	/*
+		Occlusion-aware hole filling (Hirschmuller-style). For each invalid pixel we
+		gather the nearest valid disparity along each of the 8 scan directions; a hole
+		is only filled when at least minDirections of them reach a valid value, which
+		leaves genuinely unobserved border strips empty rather than extrapolated. The
+		fill value depends on the pre-fill cause: LR-rejected holes are almost always
+		true occlusions, where the correct disparity is the occluded BACKGROUND, so we
+		take the second-smallest gathered value (Hirschmuller's rule; second-smallest,
+		not smallest, is robust to one stray direction). Every other cause is a plain
+		mismatch, so the median of the gathered values is the safer estimate. Filled
+		pixels become valid; the reason map is left untouched (it stays a pre-fill
+		record). The 8 directional sweeps are precomputed once, so a hole reads them
+		instead of re-scanning, keeping the fill order-independent and O(N).
+	*/
+	void FillHolesDirectional(cv::Mat& disparity, cv::Mat& validMask, const cv::Mat& reasonMap, int minDirections)
+	{
+		const int rows = disparity.rows;
+		const int cols = disparity.cols;
+
+		// 8 directions: E, W, N, S, NE, NW, SE, SW (step = direction we look toward).
+		static const int stepX[8] = { 1, -1, 0, 0, 1, -1, 1, -1 };
+		static const int stepY[8] = { 0, 0, -1, 1, -1, -1, 1, 1 };
+
+		cv::Mat directional[8];
+		for (int d = 0; d < 8; ++d)
+		{
+			directional[d] = PropagateNearestValid(disparity, validMask, stepX[d], stepY[d]);
+		}
+
+		std::vector<float> gathered;
+		gathered.reserve(8);
+		int filledBackground = 0; // second-smallest rule (LR-rejected occlusions)
+		int filledMedian = 0;     // median rule (mismatch-type holes)
+
+		for (int row = 0; row < rows; ++row)
+		{
+			uchar* maskRow = validMask.ptr<uchar>(row);
+			float* dispRow = disparity.ptr<float>(row);
+			const uchar* reasonRow = reasonMap.ptr<uchar>(row);
+			for (int col = 0; col < cols; ++col)
+			{
+				if (maskRow[col] != 0) { continue; } // only fill holes
+
+				gathered.clear();
+				for (int d = 0; d < 8; ++d)
+				{
+					const float value = directional[d].at<float>(row, col);
+					if (value > kInvalidDisparity) { gathered.push_back(value); }
+				}
+				if (static_cast<int>(gathered.size()) < minDirections) { continue; }
+
+				std::sort(gathered.begin(), gathered.end());
+				if (reasonRow[col] == CustomMatchReasonLrRejected)
+				{
+					// Second-smallest = the background behind the occluding surface.
+					dispRow[col] = gathered.size() >= 2 ? gathered[1] : gathered[0];
+					++filledBackground;
+				}
+				else
+				{
+					dispRow[col] = gathered[gathered.size() / 2];
+					++filledMedian;
+				}
+				maskRow[col] = 255;
+			}
+		}
+
+		std::cout << "Custom matcher: directional fill filled " << (filledBackground + filledMedian)
+			<< " pixels (" << filledBackground << " background/second-smallest, "
+			<< filledMedian << " median)." << std::endl;
+	}
+
+	/*
+		Guide-weighted diffusion of the mismatch-type fills (Jacobi normalized
+		convolution), run after FillHolesDirectional and before WeightedMedianRefine.
+		The directional fill plants a single value across a whole hole interior; the
+		weighted median only corrects it within ~radius px of the rim, so large blob
+		interiors keep a wrong constant depth. This stage relaxes those interiors toward
+		a guide-weighted average of the surrounding real measurements. Matched pixels
+		(reason 0) and the deliberate occlusion background (reason 3) are read-only
+		ANCHORS; only mismatch fills (valid AND reason 1/2/4) are updated. Each iteration
+		solves d_p <- sum_q w_q d_q / sum_q w_q over the (2r+1)^2 window, with
+		w_q = exp(-(I_p - I_q)^2 / 2 sigma^2) * a_q, a_q = 1 for anchors, 0.25 for other
+		fills (real measurements dominate but information still crosses hole interiors),
+		0 for invalid pixels. I is the left grayscale guide at working resolution.
+
+		The exp weight is bilinear in a quantized guide, so the whole pass reduces to box
+		filters instead of a per-neighbour exp: with L intensity levels of centre c_l,
+		W_l(q) = exp(-(I_q - c_l)^2 / 2 sigma^2) a_q, num_l = boxSum(W_l d) and
+		den_l = boxSum(W_l); each updated pixel reads num/den linearly interpolated
+		between the two levels bracketing its own intensity I_p -- exactly the brute-force
+		weighted average, at box-filter cost. The weight fields W_l depend only on the
+		(fixed) guide and anchor weights, so they -- and the interpolated denominator --
+		are computed once and reused every iteration; only num is rebuilt as d changes.
+		d is double-buffered across the window sums so the pass is Jacobi
+		(order-independent), and the accumulators stay small (a handful of full-size
+		buffers plus the L weight fields).
+	*/
+	void GuidedDiffusionRefine(cv::Mat& disparity, const cv::Mat& validMask, const cv::Mat& reasonMap, const cv::Mat& guide, int radius, float sigmaColor, int iterations)
+	{
+		if (iterations <= 0 || radius <= 0) { return; }
+
+		const int rows = disparity.rows;
+		const int cols = disparity.cols;
+		const int windowSize = 2 * radius + 1;
+		const float invTwoSigmaSq = 1.0f / (2.0f * sigmaColor * sigmaColor);
+		constexpr int kLevels = 16;
+		constexpr float kEps = 1e-6f;
+
+		// Per-pixel guide weight a_q and the set of pixels this stage rewrites. Anchors
+		// (matched / occlusion background) contribute at full weight and are never
+		// updated; mismatch fills contribute at quarter weight and ARE updated; invalid
+		// pixels are excluded (weight 0), so the sentinel never leaks into a sum.
+		cv::Mat anchorWeight(disparity.size(), CV_32F, cv::Scalar(0.0f));
+		cv::Mat updateMask(disparity.size(), CV_8U, cv::Scalar(0));
+		for (int row = 0; row < rows; ++row)
+		{
+			const uchar* maskRow = validMask.ptr<uchar>(row);
+			const uchar* reasonRow = reasonMap.ptr<uchar>(row);
+			float* aRow = anchorWeight.ptr<float>(row);
+			uchar* uRow = updateMask.ptr<uchar>(row);
+			for (int col = 0; col < cols; ++col)
+			{
+				if (maskRow[col] == 0) { continue; }
+				if (reasonRow[col] == CustomMatchReasonMatched || reasonRow[col] == CustomMatchReasonLrRejected)
+				{
+					aRow[col] = 1.0f; // anchor: real measurement or deliberate background
+				}
+				else
+				{
+					aRow[col] = 0.25f; // mismatch fill: both a weak source and an updated pixel
+					uRow[col] = 255;
+				}
+			}
+		}
+
+		const int updateCount = cv::countNonZero(updateMask);
+		if (updateCount == 0) { return; }
+
+		// Quantize the guide range into kLevels centres spanning [min, max]; each pixel's
+		// bracketing lower level and interpolation fraction depend only on the (fixed)
+		// guide, so precompute them once.
+		double guideMin = 0.0;
+		double guideMax = 0.0;
+		cv::minMaxLoc(guide, &guideMin, &guideMax);
+		const float step = std::max(1e-3f, static_cast<float>(guideMax - guideMin) / (kLevels - 1));
+
+		cv::Mat loIndex(disparity.size(), CV_32S);
+		cv::Mat frac(disparity.size(), CV_32F);
+		for (int row = 0; row < rows; ++row)
+		{
+			const float* gRow = guide.ptr<float>(row);
+			int* loRow = loIndex.ptr<int>(row);
+			float* fRow = frac.ptr<float>(row);
+			for (int col = 0; col < cols; ++col)
+			{
+				float f = (gRow[col] - static_cast<float>(guideMin)) / step;
+				int lo = static_cast<int>(std::floor(f));
+				if (lo < 0) { lo = 0; }
+				if (lo > kLevels - 2) { lo = kLevels - 2; }
+				loRow[col] = lo;
+				fRow[col] = f - static_cast<float>(lo);
+			}
+		}
+
+		const double tStart = static_cast<double>(cv::getTickCount());
+
+		// Precompute the iteration-independent per-level weight fields W_l and the
+		// interpolated denominator (den_l = boxSum(W_l) also never changes, since a_q and
+		// I are fixed). Only the numerator is rebuilt per iteration.
+		std::vector<cv::Mat> weightLevel(kLevels);
+		cv::Mat denAcc(disparity.size(), CV_32F, cv::Scalar(0.0f));
+		for (int level = 0; level < kLevels; ++level)
+		{
+			const float centre = static_cast<float>(guideMin) + level * step;
+			cv::Mat weight(disparity.size(), CV_32F);
+			cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range)
+			{
+				for (int row = range.start; row < range.end; ++row)
+				{
+					const float* gRow = guide.ptr<float>(row);
+					const float* aRow = anchorWeight.ptr<float>(row);
+					float* wRow = weight.ptr<float>(row);
+					for (int col = 0; col < cols; ++col)
+					{
+						const float a = aRow[col];
+						if (a == 0.0f) { wRow[col] = 0.0f; continue; }
+						const float diff = gRow[col] - centre;
+						wRow[col] = std::exp(-(diff * diff) * invTwoSigmaSq) * a;
+					}
+				}
+			});
+			weightLevel[level] = weight;
+
+			const cv::Mat denLevel = WindowSum(weight, windowSize);
+			cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range)
+			{
+				for (int row = range.start; row < range.end; ++row)
+				{
+					const uchar* uRow = updateMask.ptr<uchar>(row);
+					const int* loRow = loIndex.ptr<int>(row);
+					const float* fRow = frac.ptr<float>(row);
+					const float* denRow = denLevel.ptr<float>(row);
+					float* denAccRow = denAcc.ptr<float>(row);
+					for (int col = 0; col < cols; ++col)
+					{
+						if (uRow[col] == 0) { continue; }
+						const int lo = loRow[col];
+						if (lo == level) { denAccRow[col] += (1.0f - fRow[col]) * denRow[col]; }
+						else if (lo + 1 == level) { denAccRow[col] += fRow[col] * denRow[col]; }
+					}
+				}
+			});
+		}
+
+		for (int iter = 0; iter < iterations; ++iter)
+		{
+			cv::Mat numAcc(disparity.size(), CV_32F, cv::Scalar(0.0f));
+			for (int level = 0; level < kLevels; ++level)
+			{
+				// num_l = boxSum(W_l * d) with the CURRENT disparity (invalid pixels carry
+				// W_l = 0, so their sentinel contributes nothing).
+				cv::Mat weightedDisp;
+				cv::multiply(weightLevel[level], disparity, weightedDisp);
+				const cv::Mat numLevel = WindowSum(weightedDisp, windowSize);
+
+				cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range)
+				{
+					for (int row = range.start; row < range.end; ++row)
+					{
+						const uchar* uRow = updateMask.ptr<uchar>(row);
+						const int* loRow = loIndex.ptr<int>(row);
+						const float* fRow = frac.ptr<float>(row);
+						const float* numRow = numLevel.ptr<float>(row);
+						float* numAccRow = numAcc.ptr<float>(row);
+						for (int col = 0; col < cols; ++col)
+						{
+							if (uRow[col] == 0) { continue; }
+							const int lo = loRow[col];
+							if (lo == level) { numAccRow[col] += (1.0f - fRow[col]) * numRow[col]; }
+							else if (lo + 1 == level) { numAccRow[col] += fRow[col] * numRow[col]; }
+						}
+					}
+				});
+			}
+
+			// Jacobi update: rewrite every mismatch-fill pixel from the interpolated
+			// normalized convolution. Anchors are never in updateMask, so matched geometry
+			// and the occlusion background are left exactly as they were.
+			cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range)
+			{
+				for (int row = range.start; row < range.end; ++row)
+				{
+					const uchar* uRow = updateMask.ptr<uchar>(row);
+					const float* numAccRow = numAcc.ptr<float>(row);
+					const float* denAccRow = denAcc.ptr<float>(row);
+					float* dRow = disparity.ptr<float>(row);
+					for (int col = 0; col < cols; ++col)
+					{
+						if (uRow[col] == 0 || denAccRow[col] < kEps) { continue; }
+						dRow[col] = numAccRow[col] / denAccRow[col];
+					}
+				}
+			});
+		}
+
+		const double seconds = (static_cast<double>(cv::getTickCount()) - tStart) / cv::getTickFrequency();
+		std::cout << "Custom matcher: guided diffusion refined " << updateCount << " pixels ("
+			<< iterations << " iterations) in " << seconds << " s." << std::endl;
+	}
+
+	/*
+		Edge-aware weighted median over FILLED pixels only (final-valid AND a non-zero
+		pre-fill reason), guided by the left grayscale image at working resolution.
+		For each filled pixel we collect its valid window neighbours with weight
+		w = exp(-(I_p - I_q)^2 / (2 sigmaColor^2)) and take the weighted median (the
+		value where the cumulative weight first reaches half the total). Guiding by
+		intensity keeps the fill from bleeding disparity across image edges. The pass
+		writes into a copy and swaps, so it is order-independent; rows are split with
+		cv::parallel_for_ because the window is large over millions of filled pixels.
+	*/
+	void WeightedMedianRefine(cv::Mat& disparity, const cv::Mat& validMask, const cv::Mat& reasonMap, const cv::Mat& guide, int radius, float sigmaColor)
+	{
+		if (radius <= 0) { return; }
+
+		const int rows = disparity.rows;
+		const int cols = disparity.cols;
+		const float invTwoSigmaSq = 1.0f / (2.0f * sigmaColor * sigmaColor);
+		cv::Mat out = disparity.clone();
+
+		cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range)
+		{
+			std::vector<std::pair<float, float>> items; // (disparity, weight)
+			items.reserve(static_cast<size_t>((2 * radius + 1) * (2 * radius + 1)));
+
+			for (int row = range.start; row < range.end; ++row)
+			{
+				const uchar* maskRow = validMask.ptr<uchar>(row);
+				const uchar* reasonRow = reasonMap.ptr<uchar>(row);
+				const float* guideRow = guide.ptr<float>(row);
+				float* outRow = out.ptr<float>(row);
+
+				for (int col = 0; col < cols; ++col)
+				{
+					if (maskRow[col] == 0 || reasonRow[col] == CustomMatchReasonMatched) { continue; } // filled pixels only
+
+					const float centreIntensity = guideRow[col];
+					items.clear();
+					double weightSum = 0.0;
+
+					const int r0 = std::max(0, row - radius);
+					const int r1 = std::min(rows - 1, row + radius);
+					const int c0 = std::max(0, col - radius);
+					const int c1 = std::min(cols - 1, col + radius);
+					for (int wr = r0; wr <= r1; ++wr)
+					{
+						const uchar* wMask = validMask.ptr<uchar>(wr);
+						const float* wGuide = guide.ptr<float>(wr);
+						const float* wDisp = disparity.ptr<float>(wr);
+						for (int wc = c0; wc <= c1; ++wc)
+						{
+							if (wMask[wc] == 0) { continue; }
+							const float diff = centreIntensity - wGuide[wc];
+							const float weight = std::exp(-(diff * diff) * invTwoSigmaSq);
+							items.emplace_back(wDisp[wc], weight);
+							weightSum += weight;
+						}
+					}
+
+					if (items.empty()) { continue; }
+
+					std::sort(items.begin(), items.end(),
+						[](const std::pair<float, float>& a, const std::pair<float, float>& b) { return a.first < b.first; });
+					const double half = 0.5 * weightSum;
+					double cumulative = 0.0;
+					float median = items.back().first;
+					for (const std::pair<float, float>& item : items)
+					{
+						cumulative += item.second;
+						if (cumulative >= half) { median = item.first; break; }
+					}
+					outRow[col] = median;
+				}
+			}
+		});
+
+		disparity = out; // order-independent swap
+	}
 }
 
 cv::Mat CustomDenseMatcher::ConvertToGrayscale(const cv::Mat& image) const
@@ -524,6 +920,34 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	// Left-reference pass (the disparity we keep).
 	cv::Mat disparityWork = MatchDirectionPyramid(leftPyramid, rightPyramid, scales, config, /*leftToRight=*/true);
 
+	/*
+		Pre-fill failure-reason map at working resolution, seeded from the L->R
+		pyramid result: every invalid pixel is "never matched" (code 1), then the
+		known border / out-of-image strips are reclassified as "border" (code 2). The
+		out-of-image strip is the leftmost columns up to the maximum observed
+		disparity: for a left reference a pixel at column c only has a right-view
+		correspondent when c >= its disparity, so the far-left band is genuinely
+		unobservable rather than an unreliable match. The LR check and speckle filter
+		below overwrite the pixels they reject with codes 3 and 4; whatever survives
+		stays 0 (matched).
+	*/
+	const int reasonBorderRadius = config.customWindowSize / 2;
+	cv::Mat reasonWork(disparityWork.size(), CV_8U, cv::Scalar(CustomMatchReasonMatched));
+	cv::Mat invalidWork = disparityWork <= kInvalidDisparity;
+	reasonWork.setTo(CustomMatchReasonNeverMatched, invalidWork);
+
+	double maxObservedDisparity = 0.0;
+	cv::minMaxLoc(disparityWork, nullptr, &maxObservedDisparity, nullptr, nullptr, ~invalidWork);
+	const int leftStrip = std::min(disparityWork.cols, std::max(0, static_cast<int>(std::lround(maxObservedDisparity))));
+
+	cv::Mat borderRegion = cv::Mat::zeros(disparityWork.size(), CV_8U);
+	borderRegion.rowRange(0, std::min(reasonBorderRadius, disparityWork.rows)).setTo(255);
+	borderRegion.rowRange(std::max(0, disparityWork.rows - reasonBorderRadius), disparityWork.rows).setTo(255);
+	borderRegion.colRange(0, std::min(reasonBorderRadius, disparityWork.cols)).setTo(255);
+	borderRegion.colRange(std::max(0, disparityWork.cols - reasonBorderRadius), disparityWork.cols).setTo(255);
+	borderRegion.colRange(0, leftStrip).setTo(255); // left out-of-image band
+	reasonWork.setTo(CustomMatchReasonBorder, borderRegion & invalidWork);
+
 	// Left-right consistency: re-run the whole pyramid right->left and reject final
 	// pixels whose disparity disagrees with the reverse match (occlusions / bad
 	// matches). Applied only at the finest level.
@@ -546,6 +970,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 				if (matchCol < 0 || matchCol >= width)
 				{
 					leftPtr[col] = kInvalidDisparity;
+					reasonWork.at<uchar>(row, col) = CustomMatchReasonLrRejected;
 					++rejected;
 					continue;
 				}
@@ -554,6 +979,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 				if (dR <= kInvalidDisparity || std::abs(dR - dL) > config.customLrConsistency)
 				{
 					leftPtr[col] = kInvalidDisparity;
+					reasonWork.at<uchar>(row, col) = CustomMatchReasonLrRejected;
 					++rejected;
 				}
 			}
@@ -564,8 +990,53 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	// Post-filtering at final working resolution (our own implementations).
 	cv::Mat maskWork = disparityWork > kInvalidDisparity;
 	ValidMedianFilter(disparityWork, maskWork, config.customMedianKernel);
+
+	// Diff the mask across the speckle pass so removed pixels get cause code 4 in the
+	// reason map (the median filter above never invalidates, so this mask is exact).
+	const cv::Mat maskBeforeSpeckle = disparityWork > kInvalidDisparity;
 	SpeckleFilter(disparityWork, maskWork, config.customSpeckleMinArea, config.customSpeckleTolerance);
 	maskWork = disparityWork > kInvalidDisparity;
+	reasonWork.setTo(CustomMatchReasonSpeckle, maskBeforeSpeckle & ~maskWork);
+
+	// Snapshot the genuinely-matched mask before filling: this is the honest,
+	// fill-free coverage exported for evaluation as matchedMask.
+	const cv::Mat matchedMaskWork = maskWork.clone();
+
+	/*
+		Occlusion-aware densification. FillHolesDirectional turns holes with enough
+		directional support into valid disparities (background rule for LR-rejected
+		occlusions, median rule otherwise); WeightedMedianRefine then smooths only
+		the filled pixels along image edges, guided by the finest left pyramid level
+		(working resolution, CV_32F, 0..255). Both leave matched pixels and the reason
+		map untouched.
+	*/
+	if (config.customFillHoles)
+	{
+		FillHolesDirectional(disparityWork, maskWork, reasonWork, config.customFillMinDirections);
+
+		const cv::Mat& guide = leftPyramid.back(); // finest level == working resolution
+
+		// Guide-weighted diffusion of the mismatch-type fills (reason 1/2/4) before the
+		// weighted median: relaxes big blob interiors toward the surrounding real
+		// measurements, which the rim-only weighted median cannot reach.
+		GuidedDiffusionRefine(disparityWork, maskWork, reasonWork, guide,
+			config.customGuidedFillRadius, config.customGuidedFillSigmaColor,
+			config.customGuidedFillIterations);
+
+		if (config.customWeightedMedianRadius > 0)
+		{
+			const double tStart = static_cast<double>(cv::getTickCount());
+			for (int iteration = 0; iteration < config.customWeightedMedianIterations; ++iteration)
+			{
+				WeightedMedianRefine(disparityWork, maskWork, reasonWork, guide,
+					config.customWeightedMedianRadius, config.customWeightedMedianSigmaColor);
+			}
+			const double seconds = (static_cast<double>(cv::getTickCount()) - tStart) / cv::getTickFrequency();
+			std::cout << "Custom matcher: weighted-median refinement (" << config.customWeightedMedianIterations
+				<< " pass(es), radius " << config.customWeightedMedianRadius << ") took "
+				<< seconds << " s." << std::endl;
+		}
+	}
 
 	// Upscale the final working disparity to full resolution. With the finest level
 	// at customFinalDownscale this is only a small (e.g. 2x) nearest-neighbour step,
@@ -576,6 +1047,13 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	cv::Mat maskFull;
 	cv::resize(disparityWork, disparityFull, fullSize, 0, 0, cv::INTER_NEAREST);
 	cv::resize(maskWork, maskFull, fullSize, 0, 0, cv::INTER_NEAREST);
+
+	// Diagnostics at full resolution: the pre-fill matched mask and the pre-fill
+	// reason map, nearest-upscaled to keep their discrete labels intact.
+	cv::Mat matchedMaskFull;
+	cv::Mat reasonFull;
+	cv::resize(matchedMaskWork, matchedMaskFull, fullSize, 0, 0, cv::INTER_NEAREST);
+	cv::resize(reasonWork, reasonFull, fullSize, 0, 0, cv::INTER_NEAREST);
 
 	// Disparity scales with image width: a disparity of d at the finest working
 	// resolution corresponds to d / finalScale full-resolution pixels.
@@ -588,6 +1066,8 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	DenseMatchingResult result;
 	result.rawDisparity = disparityFull;
 	result.validDisparityMask = maskFull;
+	result.matchedMask = matchedMaskFull;
+	result.failureReason = reasonFull;
 	cv::normalize(result.rawDisparity, result.disparityVisualization, 0, 255, cv::NORM_MINMAX, CV_8U, result.validDisparityMask);
 
 	double minVal = 0.0;
