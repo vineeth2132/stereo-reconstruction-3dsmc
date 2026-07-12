@@ -64,4 +64,4 @@ out_dl/
 .venv-dust3r/
 *.pth
 *.pt
-*.ckpt
+*.ckpt.venv-raft-gpu/

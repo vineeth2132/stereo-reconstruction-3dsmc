@@ -76,23 +76,74 @@ def load_pred(out_dir: Path, tag: str) -> np.ndarray | None:
     out[~np.isfinite(out)] = np.nan
     return out
 
+def align_gt_to_prediction(
+    gt: np.ndarray,
+    pred_shape: tuple[int, int],
+    tag: str,
+) -> np.ndarray:
+    """Resize/crop GT so it matches the prediction resolution."""
 
-def evaluate(pred: np.ndarray, gt: np.ndarray) -> dict | None:
-    """Compute error metrics over the pixels valid in both maps. Returns None if
-    there is no overlap."""
+    if gt.shape == pred_shape:
+        return gt.copy()
 
-    # RAFT may be evaluated at a lower resolution than the C++ outputs.
-    # Resize GT to prediction resolution so the same evaluator can handle RAFT.
-    if pred.shape != gt.shape:
-        gt_eval = cv2.resize(
+    target_h, target_w = pred_shape
+
+    if tag == "dust3r":
+        gt_h, gt_w = gt.shape
+
+        # DUSt3R scales the long edge, then center-crops vertically.
+        scale = target_w / gt_w
+        resized_h = int(round(gt_h * scale))
+
+        resized = cv2.resize(
             gt.astype(np.float32),
-            (pred.shape[1], pred.shape[0]),
-            interpolation=cv2.INTER_NEAREST
+            (target_w, resized_h),
+            interpolation=cv2.INTER_NEAREST,
         )
-        gt_eval[~np.isfinite(gt_eval)] = np.nan
-        gt_eval[gt_eval <= 0.0] = np.nan
+
+        if resized_h < target_h:
+            raise ValueError(
+                f"DUSt3R aligned GT is too small: "
+                f"{resized.shape}, prediction={pred_shape}"
+            )
+
+        crop_top = (resized_h - target_h) // 2
+        aligned = resized[crop_top:crop_top + target_h, :]
     else:
-        gt_eval = gt
+        # RAFT and other lower-resolution predictions use direct resizing.
+        aligned = cv2.resize(
+            gt.astype(np.float32),
+            (target_w, target_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    if aligned.shape != pred_shape:
+        raise ValueError(
+            f"GT alignment shape mismatch: "
+            f"got {aligned.shape}, expected {pred_shape}"
+        )
+
+    aligned = aligned.astype(np.float32, copy=False)
+    aligned[~np.isfinite(aligned)] = np.nan
+    aligned[aligned <= 0.0] = np.nan
+
+    return aligned
+
+def evaluate(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    tag: str,
+) -> dict | None:
+    """Compute direct and median-scale-aligned depth metrics.
+
+    Direct metrics use the predicted metric depth unchanged.
+
+    Scaled metrics first multiply the prediction by the median GT/prediction
+    depth ratio. This removes one global scale bias while preserving the
+    predicted depth structure.
+    """
+
+    gt_eval = align_gt_to_prediction(gt, pred.shape, tag)
 
     both = np.isfinite(pred) & np.isfinite(gt_eval)
     count = int(both.sum())
@@ -103,86 +154,159 @@ def evaluate(pred: np.ndarray, gt: np.ndarray) -> dict | None:
 
     p = pred[both].astype(np.float64)
     g = gt_eval[both].astype(np.float64)
+
+    # Direct metric-depth errors.
     err = p - g
     abs_err = np.abs(err)
 
-    # Global scale bias: align predictions to GT by the median depth ratio, then
-    # re-measure MAE so a pure scale error shows up separately from structural error.
-    scale = float(np.median(g / p))
-    abs_err_scaled = np.abs(p * scale - g)
+    # Median global scale alignment.
+    valid_ratio = np.isfinite(g / p) & (p > 0.0)
+
+    if not np.any(valid_ratio):
+        return None
+
+    scale = float(np.median(g[valid_ratio] / p[valid_ratio]))
+
+    p_scaled = p * scale
+    err_scaled = p_scaled - g
+    abs_err_scaled = np.abs(err_scaled)
 
     metrics = {
         "count": count,
         "coverage": count / gt_valid if gt_valid else 0.0,
         "gt_valid": gt_valid,
+
+        # Direct metrics.
         "mae": float(abs_err.mean()),
-        "rmse": float(np.sqrt((err ** 2).mean())),
+        "rmse": float(np.sqrt(np.mean(err ** 2))),
         "median_ae": float(np.median(abs_err)),
+
+        # Scale-aligned metrics.
         "scale": scale,
         "mae_scaled": float(abs_err_scaled.mean()),
+        "rmse_scaled": float(np.sqrt(np.mean(err_scaled ** 2))),
+        "median_ae_scaled": float(np.median(abs_err_scaled)),
     }
 
-    for t in BAD_THRESHOLDS:
-        metrics[f"bad_{t}"] = float((abs_err > t).mean())
+    for threshold in BAD_THRESHOLDS:
+        metrics[f"bad_{threshold}"] = float(
+            np.mean(abs_err > threshold)
+        )
+
+        metrics[f"bad_scaled_{threshold}"] = float(
+            np.mean(abs_err_scaled > threshold)
+        )
 
     return metrics
 
-
 def print_table(results: dict[str, dict]) -> None:
     tags = list(results.keys())
+
     rows = [
         ("valid px", "count", "{:,}"),
         ("coverage", "coverage", "{:.1%}"),
+
         ("MAE (m)", "mae", "{:.4f}"),
         ("RMSE (m)", "rmse", "{:.4f}"),
         ("median AE (m)", "median_ae", "{:.4f}"),
+
         ("MAE scaled (m)", "mae_scaled", "{:.4f}"),
+        ("RMSE scaled (m)", "rmse_scaled", "{:.4f}"),
+        ("median AE scaled (m)", "median_ae_scaled", "{:.4f}"),
+
         ("scale (gt/pred)", "scale", "{:.4f}"),
     ]
-    for t in BAD_THRESHOLDS:
-        rows.append((f"bad > {t}m", f"bad_{t}", "{:.1%}"))
+
+    for threshold in BAD_THRESHOLDS:
+        rows.append(
+            (
+                f"bad > {threshold}m",
+                f"bad_{threshold}",
+                "{:.1%}",
+            )
+        )
+
+        rows.append(
+            (
+                f"bad scaled > {threshold}m",
+                f"bad_scaled_{threshold}",
+                "{:.1%}",
+            )
+        )
 
     label_w = max(len(label) for label, _, _ in rows)
-    col_w = max(12, *(len(t) for t in tags))
+    col_w = max(12, *(len(tag) for tag in tags))
 
-    header = "  " + " " * label_w + "  " + "  ".join(f"{t:>{col_w}}" for t in tags)
+    header = (
+        "  "
+        + " " * label_w
+        + "  "
+        + "  ".join(f"{tag:>{col_w}}" for tag in tags)
+    )
+
     print(header)
     print("  " + "-" * (len(header) - 2))
+
     for label, key, fmt in rows:
         cells = []
-        for t in tags:
-            value = results[t].get(key)
+
+        for tag in tags:
+            value = results[tag].get(key)
             cells.append(fmt.format(value) if value is not None else "-")
-        print("  " + f"{label:<{label_w}}" + "  " + "  ".join(f"{c:>{col_w}}" for c in cells))
 
+        print(
+            "  "
+            + f"{label:<{label_w}}"
+            + "  "
+            + "  ".join(f"{cell:>{col_w}}" for cell in cells)
+        )
 
-def render_error_maps(pred_maps: dict[str, np.ndarray], gt: np.ndarray, out_dir: Path) -> None:
-    """Save one absolute-error map per tag (white = invalid), sharing a single color
-    scale with a 99th-percentile vmax so the backends are visually comparable."""
+def render_error_maps(
+    pred_maps: dict[str, np.ndarray],
+    gt: np.ndarray,
+    out_dir: Path,
+) -> None:
+    """Save median-scale-aligned absolute-error maps.
+
+    White pixels are invalid. All backends share one color scale.
+    """
 
     error_maps: dict[str, np.ndarray] = {}
 
     for tag, pred in pred_maps.items():
-        if pred.shape != gt.shape:
-            gt_eval = cv2.resize(
-                gt.astype(np.float32),
-                (pred.shape[1], pred.shape[0]),
-                interpolation=cv2.INTER_NEAREST
-            )
-            gt_eval[~np.isfinite(gt_eval)] = np.nan
-            gt_eval[gt_eval <= 0.0] = np.nan
-        else:
-            gt_eval = gt
+        gt_eval = align_gt_to_prediction(gt, pred.shape, tag)
 
         both = np.isfinite(pred) & np.isfinite(gt_eval)
 
-        err = np.full(pred.shape, np.nan, dtype=np.float32)
-        err[both] = np.abs(pred[both] - gt_eval[both])
-        error_maps[tag] = err
+        err_map = np.full(pred.shape, np.nan, dtype=np.float32)
 
-    finite_parts = [e[np.isfinite(e)].ravel() for e in error_maps.values()]
+        if not np.any(both):
+            error_maps[tag] = err_map
+            continue
 
-    finite_parts = [x for x in finite_parts if x.size > 0]
+        p = pred[both].astype(np.float64)
+        g = gt_eval[both].astype(np.float64)
+
+        valid_ratio = np.isfinite(g / p) & (p > 0.0)
+
+        if not np.any(valid_ratio):
+            error_maps[tag] = err_map
+            continue
+
+        scale = float(np.median(g[valid_ratio] / p[valid_ratio]))
+
+        err_map[both] = np.abs(
+            pred[both].astype(np.float32) * np.float32(scale)
+            - gt_eval[both]
+        )
+
+        error_maps[tag] = err_map
+
+    finite_parts = [
+        error[np.isfinite(error)].ravel()
+        for error in error_maps.values()
+        if np.any(np.isfinite(error))
+    ]
 
     if not finite_parts:
         print("  no overlapping pixels to render error maps")
@@ -192,21 +316,41 @@ def render_error_maps(pred_maps: dict[str, np.ndarray], gt: np.ndarray, out_dir:
     vmax = float(np.percentile(finite, 99))
 
     cmap = plt.get_cmap("turbo").copy()
-    cmap.set_bad("white")  # invalid (NaN) pixels -> white
+    cmap.set_bad("white")
 
-    for tag, err in error_maps.items():
+    for tag, error in error_maps.items():
         fig, ax = plt.subplots(figsize=(9, 6))
-        im = ax.imshow(err, cmap=cmap, vmin=0.0, vmax=vmax, interpolation="nearest")
-        ax.set_title(f"Absolute depth error — {tag} (white = invalid)")
+
+        image = ax.imshow(
+            error,
+            cmap=cmap,
+            vmin=0.0,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+
+        ax.set_title(
+            f"Scale-aligned absolute depth error — {tag} "
+            "(white = invalid)"
+        )
         ax.set_xticks([])
         ax.set_yticks([])
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("|error| (m)")
+
+        colorbar = fig.colorbar(
+            image,
+            ax=ax,
+            fraction=0.046,
+            pad=0.04,
+        )
+        colorbar.set_label("|scaled error| (m)")
+
         fig.tight_layout()
-        dest = out_dir / f"error_{tag}_scaled.png"
-        fig.savefig(dest, dpi=150, bbox_inches="tight")
+
+        destination = out_dir / f"error_{tag}_scaled.png"
+        fig.savefig(destination, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        print(f"  wrote {dest.name}")
+
+        print(f"  wrote {destination.name}")
         
 
 
@@ -240,7 +384,7 @@ def main() -> None:
         if pred is None:
             continue
         pred_maps[tag] = pred
-        metrics = evaluate(pred, gt)
+        metrics = evaluate(pred, gt, tag)
         if metrics is None:
             print(f"  skip {tag}: no overlap with GT")
             continue
