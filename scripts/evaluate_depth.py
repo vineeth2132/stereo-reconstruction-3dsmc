@@ -76,23 +76,71 @@ def load_pred(out_dir: Path, tag: str) -> np.ndarray | None:
     out[~np.isfinite(out)] = np.nan
     return out
 
+def align_gt_to_prediction(
+    gt: np.ndarray,
+    pred_shape: tuple[int, int],
+    tag: str,
+) -> np.ndarray:
+    """Align ground truth with a backend prediction.
 
-def evaluate(pred: np.ndarray, gt: np.ndarray) -> dict | None:
+    RAFT and other lower-resolution outputs use a direct resize. DUSt3R first
+    resizes the image so its long edge is 512 pixels, then center-crops the
+    result to dimensions compatible with the model patch size.
+    """
+    if gt.shape == pred_shape:
+        return gt
+
+    target_h, target_w = pred_shape
+
+    if tag == "dust3r":
+        gt_h, gt_w = gt.shape
+
+        # DUSt3R load_images(..., size=512) scales the long image edge to 512.
+        scale = target_w / gt_w
+        resized_h = int(round(gt_h * scale))
+
+        resized = cv2.resize(
+            gt.astype(np.float32),
+            (target_w, resized_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        if resized_h < target_h:
+            raise ValueError(
+                "DUSt3R GT alignment produced an image smaller than the "
+                f"prediction: resized={resized.shape}, prediction={pred_shape}"
+            )
+
+        crop_top = (resized_h - target_h) // 2
+        aligned = resized[crop_top:crop_top + target_h, :]
+
+        if aligned.shape != pred_shape:
+            raise ValueError(
+                "Unexpected DUSt3R GT alignment shape: "
+                f"{aligned.shape}, expected {pred_shape}"
+            )
+    else:
+        # Preserve the existing RAFT/general lower-resolution behavior.
+        aligned = cv2.resize(
+            gt.astype(np.float32),
+            (target_w, target_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    aligned = aligned.astype(np.float32, copy=False)
+    aligned[~np.isfinite(aligned)] = np.nan
+    aligned[aligned <= 0.0] = np.nan
+    return aligned
+
+def evaluate(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    tag: str,
+) -> dict | None:
     """Compute error metrics over the pixels valid in both maps. Returns None if
     there is no overlap."""
 
-    # RAFT may be evaluated at a lower resolution than the C++ outputs.
-    # Resize GT to prediction resolution so the same evaluator can handle RAFT.
-    if pred.shape != gt.shape:
-        gt_eval = cv2.resize(
-            gt.astype(np.float32),
-            (pred.shape[1], pred.shape[0]),
-            interpolation=cv2.INTER_NEAREST
-        )
-        gt_eval[~np.isfinite(gt_eval)] = np.nan
-        gt_eval[gt_eval <= 0.0] = np.nan
-    else:
-        gt_eval = gt
+    gt_eval = align_gt_to_prediction(gt, pred.shape, tag)
 
     both = np.isfinite(pred) & np.isfinite(gt_eval)
     count = int(both.sum())
@@ -163,16 +211,7 @@ def render_error_maps(pred_maps: dict[str, np.ndarray], gt: np.ndarray, out_dir:
     error_maps: dict[str, np.ndarray] = {}
 
     for tag, pred in pred_maps.items():
-        if pred.shape != gt.shape:
-            gt_eval = cv2.resize(
-                gt.astype(np.float32),
-                (pred.shape[1], pred.shape[0]),
-                interpolation=cv2.INTER_NEAREST
-            )
-            gt_eval[~np.isfinite(gt_eval)] = np.nan
-            gt_eval[gt_eval <= 0.0] = np.nan
-        else:
-            gt_eval = gt
+        gt_eval = align_gt_to_prediction(gt, pred.shape, tag)
 
         both = np.isfinite(pred) & np.isfinite(gt_eval)
 
@@ -240,7 +279,7 @@ def main() -> None:
         if pred is None:
             continue
         pred_maps[tag] = pred
-        metrics = evaluate(pred, gt)
+        metrics = evaluate(pred, gt, tag)
         if metrics is None:
             print(f"  skip {tag}: no overlap with GT")
             continue
