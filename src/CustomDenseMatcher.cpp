@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <limits>
+#include <intrin.h>
 
 namespace
 {
@@ -178,6 +180,292 @@ namespace
 		disparity.colRange(std::max(0, size.width - radius), size.width).setTo(kInvalidDisparity);
 
 		return disparity;
+	}
+
+
+	/*
+		Sweep the target image over all integer disparity hypotheses in [sLo, sHi]
+		and evaluate each candidate using mean squared difference over a local window.
+
+		For every pixel, the disparity with the minimum SSD cost is selected.
+		The neighbouring costs around the winner are retained for optional parabola-
+		based subpixel refinement. Matches whose minimum cost exceeds maxSsdCost,
+		or whose support window intersects the image border, are rejected.
+	*/
+	cv::Mat SsdSweep(const cv::Mat& reference, const cv::Mat& target, int sLo, int sHi, int windowSize, float maxSsdCost, bool subpixel, bool leftToRight)
+	{
+		const int radius = windowSize / 2;
+		const cv::Size size = reference.size();
+
+		cv::Mat bestCost(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
+		cv::Mat bestD(size, CV_32F, cv::Scalar(kInvalidDisparity));
+		cv::Mat costMinus(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
+		cv::Mat costPlus(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
+		cv::Mat previousCost(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
+
+		for (int d = sLo; d <= sHi; ++d)
+		{
+			const cv::Mat shiftedTarget =
+				ShiftHorizontally(target, d, leftToRight);
+
+			cv::Mat difference;
+			cv::subtract(reference, shiftedTarget, difference);
+
+			cv::Mat squaredDifference;
+			cv::multiply(difference, difference, squaredDifference);
+
+			cv::Mat cost = WindowSum(squaredDifference, windowSize);
+			cost /= static_cast<float>(windowSize * windowSize);
+
+			cv::Mat previousWasBest;
+			cv::compare(bestD, static_cast<double>(d - 1), previousWasBest, cv::CMP_EQ);
+
+			cost.copyTo(costPlus, previousWasBest);
+
+			cv::Mat better = cost < bestCost;
+
+			cost.copyTo(bestCost, better);
+			bestD.setTo(static_cast<double>(d), better);
+			previousCost.copyTo(costMinus, better);
+			costPlus.setTo(std::numeric_limits<float>::max(), better);
+
+			cost.copyTo(previousCost);
+		}
+
+		cv::Mat disparity = bestD.clone();
+
+		if (subpixel)
+		{
+			for (int row = 0; row < size.height; ++row)
+			{
+				const float* dPtr = bestD.ptr<float>(row);
+				const float* cPtr = bestCost.ptr<float>(row);
+				const float* mPtr = costMinus.ptr<float>(row);
+				const float* pPtr = costPlus.ptr<float>(row);
+				float* outPtr = disparity.ptr<float>(row);
+
+				for (int col = 0; col < size.width; ++col)
+				{
+					const float m = mPtr[col];
+					const float c = cPtr[col];
+					const float p = pPtr[col];
+
+					if (!std::isfinite(m) || !std::isfinite(p))
+						continue;
+
+					const float denominator = m - 2.0f * c + p;
+
+					if (std::abs(denominator) < 1e-6f)
+						continue;
+
+					const float delta = 0.5f * (m - p) / denominator;
+
+					if (delta > -1.0f && delta < 1.0f)
+						outPtr[col] = dPtr[col] + delta;
+				}
+			}
+		}
+
+		disparity.rowRange(0, std::min(radius, size.height)).setTo(kInvalidDisparity);
+		disparity.rowRange(std::max(0, size.height - radius), size.height).setTo(kInvalidDisparity);
+		disparity.colRange(0, std::min(radius, size.width)).setTo(kInvalidDisparity);
+		disparity.colRange(std::max(0, size.width - radius), size.width).setTo(kInvalidDisparity);
+
+		cv::Mat weakMatches = bestCost > maxSsdCost;
+		disparity.setTo(kInvalidDisparity, weakMatches);
+
+		return disparity;
+	}
+
+
+	/*
+		Compute a Census descriptor for every pixel.
+
+		Each neighbour inside the census window is compared with the centre pixel.
+		The binary comparison results are packed into a 32-bit descriptor. With the
+		current radius of 2, the 5x5 neighbourhood produces 24 comparison bits.
+
+		Pixels whose Census window crosses the image border keep the zero descriptor
+		and are excluded later by CensusSweep.
+	*/
+	cv::Mat ComputeCensusTransform(const cv::Mat& image, int radius)
+	{
+		cv::Mat census(image.size(), CV_32S, cv::Scalar(0));
+
+		for (int row = radius; row < image.rows - radius; ++row)
+		{
+			for (int col = radius; col < image.cols - radius; ++col)
+			{
+				const float center = image.at<float>(row, col);
+				unsigned int descriptor = 0;
+
+				for (int dy = -radius; dy <= radius; ++dy)
+				{
+					for (int dx = -radius; dx <= radius; ++dx)
+					{
+						if (dx == 0 && dy == 0)
+							continue;
+
+						descriptor <<= 1;
+
+						if (image.at<float>(row + dy, col + dx) < center)
+							descriptor |= 1u;
+					}
+				}
+
+				census.at<int>(row, col) = static_cast<int>(descriptor);
+			}
+		}
+
+		return census;
+	}
+
+	/*
+		Return the Hamming distance between two Census descriptors by counting the
+		set bits in their XOR result.
+	*/
+	int HammingDistance(unsigned int a, unsigned int b)
+	{
+		return __popcnt(a ^ b);
+	}
+
+
+	/*
+		Sweep all disparity hypotheses and evaluate each match using Census distance.
+
+		For each disparity, the target Census descriptors are compared with the
+		reference descriptors using Hamming distance. Per-pixel distances are then
+		aggregated over windowSize x windowSize neighbourhoods.
+
+		The disparity with the minimum aggregated cost is selected. Candidates with
+		incomplete descriptor support, border overlap or a final cost above
+		maxCensusCost are rejected.
+	*/
+	cv::Mat CensusSweep(const cv::Mat& reference, const cv::Mat& target, int sLo, int sHi, int windowSize, int censusRadius, float maxCensusCost, bool leftToRight)
+	{
+		const cv::Size size = reference.size();
+		const int borderRadius = censusRadius + windowSize / 2;
+		const float invalidCost = std::numeric_limits<float>::max();
+
+		const cv::Mat referenceCensus = ComputeCensusTransform(reference, censusRadius);
+
+		const cv::Mat targetCensus = ComputeCensusTransform(target, censusRadius);
+
+		cv::Mat bestCost(size, CV_32F, cv::Scalar(invalidCost));
+
+		cv::Mat bestD(size, CV_32F, cv::Scalar(kInvalidDisparity));
+
+		for (int d = sLo; d <= sHi; ++d)
+		{
+			const int shift = leftToRight ? d : -d;
+
+			cv::Mat pixelCost(size, CV_32F, cv::Scalar(0.0f));
+
+			cv::Mat validDescriptorMask(size, CV_8U, cv::Scalar(0));
+
+			for (int row = censusRadius; row < size.height - censusRadius; ++row)
+			{
+				const int* referenceRow = referenceCensus.ptr<int>(row);
+
+				float* costRow = pixelCost.ptr<float>(row);
+
+				unsigned char* validRow = validDescriptorMask.ptr<unsigned char>(row);
+
+				for (int col = censusRadius; col < size.width - censusRadius; ++col)
+				{
+					const int targetCol = col - shift;
+
+					if (targetCol < censusRadius || targetCol >= size.width - censusRadius)
+					{
+						continue;
+					}
+
+					const unsigned int referenceDescriptor = static_cast<unsigned int>(referenceRow[col]);
+					const unsigned int targetDescriptor = static_cast<unsigned int>(targetCensus.at<int>(row,targetCol));
+
+					costRow[col] = static_cast<float>(HammingDistance(referenceDescriptor,targetDescriptor));
+					validRow[col] = 255;
+				}
+			}
+
+			cv::Mat aggregatedCost = WindowSum(pixelCost, windowSize);
+
+			aggregatedCost /= static_cast<float>(windowSize * windowSize);
+
+			cv::Mat validMaskFloat;
+			validDescriptorMask.convertTo(validMaskFloat, CV_32F, 1.0 / 255.0);
+
+			cv::Mat validSupport = WindowSum(validMaskFloat, windowSize);
+
+			cv::Mat incompleteWindow = validSupport < static_cast<float>(windowSize * windowSize);
+
+			aggregatedCost.setTo(invalidCost, incompleteWindow);
+
+			cv::Mat better = aggregatedCost < bestCost;
+
+			aggregatedCost.copyTo(bestCost, better);
+
+			bestD.setTo(static_cast<double>(d), better);
+		}
+
+		cv::Mat weakMatches = bestCost > maxCensusCost;
+
+		bestD.setTo(kInvalidDisparity, weakMatches);
+
+		bestD.rowRange(0, std::min(borderRadius, size.height)).setTo(kInvalidDisparity);
+		bestD.rowRange(std::max(0, size.height - borderRadius), size.height).setTo(kInvalidDisparity);
+		bestD.colRange(0, std::min(borderRadius, size.width)).setTo(kInvalidDisparity);
+		bestD.colRange(std::max(0, size.width - borderRadius), size.width).setTo(kInvalidDisparity);
+
+		return bestD;
+	}
+
+	/*
+		Dispatch one disparity sweep using the matching cost selected in the config.
+
+		The coarse full search and every finer residual search pass through this
+		function, so the surrounding hierarchical pipeline remains identical for
+		NCC, SSD and Census.
+	*/
+	cv::Mat RunCostSweep(const cv::Mat& reference, const cv::Mat& target, int sLo, int sHi, const DenseStereoConfig& config, bool leftToRight)
+	{
+		switch (config.customCost.metric)
+		{
+		case CustomCostMetric::NCC:
+			return NccSweep(
+				reference,
+				target,
+				sLo,
+				sHi,
+				config.custom.windowSize,
+				config.customCost.minNccCorrelation,
+				config.custom.subpixel,
+				leftToRight);
+
+		case CustomCostMetric::SSD:
+			return SsdSweep(
+				reference,
+				target,
+				sLo,
+				sHi,
+				config.custom.windowSize,
+				config.customCost.maxSsdCost,
+				config.custom.subpixel,
+				leftToRight);
+
+		case CustomCostMetric::Census:
+			return CensusSweep(
+				reference,
+				target,
+				sLo,
+				sHi,
+				config.custom.windowSize,
+				config.customCost.censusRadius,
+				config.customCost.maxCensusCost,
+				leftToRight);
+		}
+
+		throw std::runtime_error("Unknown custom cost metric.");
 	}
 
 	/*
@@ -775,6 +1063,12 @@ cv::Mat CustomDenseMatcher::ConvertToGrayscale(const cv::Mat& image) const
 	return grayscaleImage;
 }
 
+/*
+	Build one image pyramid from the requested scales.
+
+	The returned levels are ordered from coarsest to finest, matching the order
+	used by MatchDirectionPyramid.
+*/
 std::vector<cv::Mat> CustomDenseMatcher::BuildPyramid(const cv::Mat& fullFloat, const std::vector<double>& scales) const
 {
 	std::vector<cv::Mat> pyramid;
@@ -797,11 +1091,9 @@ std::vector<cv::Mat> CustomDenseMatcher::BuildPyramid(const cv::Mat& fullFloat, 
 
 cv::Mat CustomDenseMatcher::MatchDirectionPyramid(const std::vector<cv::Mat>& referencePyramid, const std::vector<cv::Mat>& targetPyramid, const std::vector<double>& scales, const DenseStereoConfig& config, bool leftToRight) const
 {
-	const int windowSize = config.customWindowSize;
+	const int windowSize = config.custom.windowSize;
 	const int radius = windowSize / 2;
-	const float minCorrelation = config.customMinCorrelation;
-	const bool subpixel = config.customSubpixel;
-	const int residualRadius = config.customResidualRadius;
+	const int residualRadius = config.custom.residualRadius;
 	const char* dirTag = leftToRight ? "L->R" : "R->L";
 
 	cv::Mat disparity; // current level disparity (this level's px), sentinel = invalid
@@ -816,9 +1108,9 @@ cv::Mat CustomDenseMatcher::MatchDirectionPyramid(const std::vector<cv::Mat>& re
 		{
 			// Coarsest level: unconstrained full search. The maximum disparity is a
 			// fraction of the (tiny) coarsest width, so the range comes from the
-			// image geometry instead of a hand-tuned customNumDisparities bound.
-			const int maxD = std::max(1, static_cast<int>(std::lround(size.width * config.customMaxDisparityFraction)));
-			disparity = NccSweep(reference, target, 0, maxD, windowSize, minCorrelation, subpixel, leftToRight);
+			// image geometry instead of a fixed, hand-tuned disparity count.
+			const int maxD = std::max(1, static_cast<int>(std::lround(size.width * config.custom.maxDisparityFraction)));
+			disparity = RunCostSweep(reference, target, 0, maxD, config, leftToRight);
 
 			// No valid target overlap over the search span near the reference border.
 			const int searchSpan = maxD + radius;
@@ -851,7 +1143,7 @@ cv::Mat CustomDenseMatcher::MatchDirectionPyramid(const std::vector<cv::Mat>& re
 		WarpByPrior(target, prior, leftToRight, warpedTarget, outOfImage);
 
 		// Residual search around the prior on the warped target.
-		cv::Mat residual = NccSweep(reference, warpedTarget, -residualRadius, residualRadius, windowSize, minCorrelation, subpixel, leftToRight);
+		cv::Mat residual = RunCostSweep(reference, warpedTarget, -residualRadius, residualRadius, config, leftToRight);
 
 		cv::Mat residualValid = residual > kInvalidDisparity;
 		cv::Mat levelDisparity = prior + residual;              // valid pixels: prior + residual (+ subpixel)
@@ -870,21 +1162,39 @@ cv::Mat CustomDenseMatcher::MatchDirectionPyramid(const std::vector<cv::Mat>& re
 
 DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResult& rectificationResult, const DenseStereoConfig& config) const
 {
-	std::cout << "Custom hierarchical NCC disparity computation started." << std::endl;
+	const char* metricName = "Unknown";
 
-	if (config.customWindowSize <= 0 || config.customWindowSize % 2 == 0)
+	// Resolve the selected cost name for diagnostics and progress logging.
+	switch (config.customCost.metric)
+	{
+	case CustomCostMetric::NCC:
+		metricName = "NCC";
+		break;
+
+	case CustomCostMetric::SSD:
+		metricName = "SSD";
+		break;
+
+	case CustomCostMetric::Census:
+		metricName = "Census";
+		break;
+	}
+
+	std::cout << "Custom hierarchical " << metricName << " disparity computation started." << std::endl;
+
+	if (config.custom.windowSize <= 0 || config.custom.windowSize % 2 == 0)
 	{
 		throw std::runtime_error("customWindowSize must be a positive odd number.");
 	}
-	if (config.customFinalDownscale <= 0.0 || config.customFinalDownscale > 1.0)
+	if (config.custom.finalDownscale <= 0.0 || config.custom.finalDownscale > 1.0)
 	{
 		throw std::runtime_error("customFinalDownscale must be in (0, 1].");
 	}
-	if (config.customCoarsestDownscale <= 0.0 || config.customCoarsestDownscale > config.customFinalDownscale)
+	if (config.custom.coarsestDownscale <= 0.0 || config.custom.coarsestDownscale > config.custom.finalDownscale)
 	{
 		throw std::runtime_error("customCoarsestDownscale must be in (0, customFinalDownscale].");
 	}
-	if (config.customResidualRadius <= 0)
+	if (config.custom.residualRadius <= 0)
 	{
 		throw std::runtime_error("customResidualRadius must be positive.");
 	}
@@ -901,8 +1211,8 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	// working scale down to (roughly) the coarsest, so the coarse full search runs
 	// on a tiny image and each finer level only refines a residual.
 	std::vector<double> scalesFineToCoarse;
-	scalesFineToCoarse.push_back(config.customFinalDownscale);
-	while (scalesFineToCoarse.back() * 0.5 >= config.customCoarsestDownscale - 1e-9)
+	scalesFineToCoarse.push_back(config.custom.finalDownscale);
+	while (scalesFineToCoarse.back() * 0.5 >= config.custom.coarsestDownscale - 1e-9)
 	{
 		scalesFineToCoarse.push_back(scalesFineToCoarse.back() * 0.5);
 	}
@@ -911,11 +1221,11 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	const std::vector<cv::Mat> leftPyramid = BuildPyramid(leftFloat, scales);
 	const std::vector<cv::Mat> rightPyramid = BuildPyramid(rightFloat, scales);
 
-	const double finalScale = config.customFinalDownscale;
+	const double finalScale = config.custom.finalDownscale;
 	std::cout << "Custom matcher pyramid: " << scales.size() << " levels, scales "
 		<< scales.front() << ".." << scales.back() << ", finest "
 		<< leftPyramid.back().cols << "x" << leftPyramid.back().rows
-		<< ", window " << config.customWindowSize << std::endl;
+		<< ", window " << config.custom.windowSize << std::endl;
 
 	// Left-reference pass (the disparity we keep).
 	cv::Mat disparityWork = MatchDirectionPyramid(leftPyramid, rightPyramid, scales, config, /*leftToRight=*/true);
@@ -931,7 +1241,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 		below overwrite the pixels they reject with codes 3 and 4; whatever survives
 		stays 0 (matched).
 	*/
-	const int reasonBorderRadius = config.customWindowSize / 2;
+	const int reasonBorderRadius = config.custom.windowSize / 2;
 	cv::Mat reasonWork(disparityWork.size(), CV_8U, cv::Scalar(CustomMatchReasonMatched));
 	cv::Mat invalidWork = disparityWork <= kInvalidDisparity;
 	reasonWork.setTo(CustomMatchReasonNeverMatched, invalidWork);
@@ -951,7 +1261,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	// Left-right consistency: re-run the whole pyramid right->left and reject final
 	// pixels whose disparity disagrees with the reverse match (occlusions / bad
 	// matches). Applied only at the finest level.
-	if (config.customLrConsistency > 0.0f)
+	if (config.custom.lrConsistency > 0.0f)
 	{
 		const cv::Mat disparityRight = MatchDirectionPyramid(rightPyramid, leftPyramid, scales, config, /*leftToRight=*/false);
 
@@ -976,7 +1286,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 				}
 
 				const float dR = rightPtr[matchCol];
-				if (dR <= kInvalidDisparity || std::abs(dR - dL) > config.customLrConsistency)
+				if (dR <= kInvalidDisparity || std::abs(dR - dL) > config.custom.lrConsistency)
 				{
 					leftPtr[col] = kInvalidDisparity;
 					reasonWork.at<uchar>(row, col) = CustomMatchReasonLrRejected;
@@ -989,12 +1299,12 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 
 	// Post-filtering at final working resolution (our own implementations).
 	cv::Mat maskWork = disparityWork > kInvalidDisparity;
-	ValidMedianFilter(disparityWork, maskWork, config.customMedianKernel);
+	ValidMedianFilter(disparityWork, maskWork, config.custom.medianKernel);
 
 	// Diff the mask across the speckle pass so removed pixels get cause code 4 in the
 	// reason map (the median filter above never invalidates, so this mask is exact).
 	const cv::Mat maskBeforeSpeckle = disparityWork > kInvalidDisparity;
-	SpeckleFilter(disparityWork, maskWork, config.customSpeckleMinArea, config.customSpeckleTolerance);
+	SpeckleFilter(disparityWork, maskWork, config.custom.speckleMinArea, config.custom.speckleTolerance);
 	maskWork = disparityWork > kInvalidDisparity;
 	reasonWork.setTo(CustomMatchReasonSpeckle, maskBeforeSpeckle & ~maskWork);
 
@@ -1010,9 +1320,9 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 		(working resolution, CV_32F, 0..255). Both leave matched pixels and the reason
 		map untouched.
 	*/
-	if (config.customFillHoles)
+	if (config.custom.fillHoles)
 	{
-		FillHolesDirectional(disparityWork, maskWork, reasonWork, config.customFillMinDirections);
+		FillHolesDirectional(disparityWork, maskWork, reasonWork, config.custom.fillMinDirections);
 
 		const cv::Mat& guide = leftPyramid.back(); // finest level == working resolution
 
@@ -1020,26 +1330,26 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 		// weighted median: relaxes big blob interiors toward the surrounding real
 		// measurements, which the rim-only weighted median cannot reach.
 		GuidedDiffusionRefine(disparityWork, maskWork, reasonWork, guide,
-			config.customGuidedFillRadius, config.customGuidedFillSigmaColor,
-			config.customGuidedFillIterations);
+			config.custom.guidedFillRadius, config.custom.guidedFillSigmaColor,
+			config.custom.guidedFillIterations);
 
-		if (config.customWeightedMedianRadius > 0)
+		if (config.custom.weightedMedianRadius > 0)
 		{
 			const double tStart = static_cast<double>(cv::getTickCount());
-			for (int iteration = 0; iteration < config.customWeightedMedianIterations; ++iteration)
+			for (int iteration = 0; iteration < config.custom.weightedMedianIterations; ++iteration)
 			{
 				WeightedMedianRefine(disparityWork, maskWork, reasonWork, guide,
-					config.customWeightedMedianRadius, config.customWeightedMedianSigmaColor);
+					config.custom.weightedMedianRadius, config.custom.weightedMedianSigmaColor);
 			}
 			const double seconds = (static_cast<double>(cv::getTickCount()) - tStart) / cv::getTickFrequency();
-			std::cout << "Custom matcher: weighted-median refinement (" << config.customWeightedMedianIterations
-				<< " pass(es), radius " << config.customWeightedMedianRadius << ") took "
+			std::cout << "Custom matcher: weighted-median refinement (" << config.custom.weightedMedianIterations
+				<< " pass(es), radius " << config.custom.weightedMedianRadius << ") took "
 				<< seconds << " s." << std::endl;
 		}
 	}
 
 	// Upscale the final working disparity to full resolution. With the finest level
-	// at customFinalDownscale this is only a small (e.g. 2x) nearest-neighbour step,
+	// at config.custom.finalDownscale this is only a small nearest-neighbour step,
 	// which keeps the invalid sentinel distinct (no interpolation of valid into
 	// invalid).
 	const cv::Size fullSize = leftFullGray.size();
@@ -1076,7 +1386,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	std::cout << "Custom disparity range observed: [" << minVal << ", " << maxVal << "] full-res px. Kept "
 		<< cv::countNonZero(result.validDisparityMask) << " / " << (fullSize.width * fullSize.height)
 		<< " pixels." << std::endl;
-	std::cout << "Custom hierarchical NCC disparity computation finished successfully." << std::endl;
+	std::cout << "Custom hierarchical " << metricName << " disparity computation finished successfully." << std::endl;
 
 	return result;
 }

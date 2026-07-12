@@ -5,16 +5,17 @@
 #include <opencv2/ximgproc.hpp>
 #endif
 
-std::unique_ptr<IDenseStereoMatcher> CreateDenseMatcher(DenseStereoBackend backend)
+std::unique_ptr<IDenseStereoMatcher> CreateDenseMatcher(const DenseStereoConfig& config)
 {
-	switch (backend)
-	{
-	case DenseStereoBackend::Custom:
-		return std::make_unique<CustomDenseMatcher>();
-	case DenseStereoBackend::OpenCv:
-	default:
-		return std::make_unique<DenseStereoMatcher>();
-	}
+    switch (config.backend)
+    {
+    case DenseStereoBackend::Custom:
+        return std::make_unique<CustomDenseMatcher>();
+
+    case DenseStereoBackend::OpenCv:
+    default:
+        return std::make_unique<DenseStereoMatcher>();
+    }
 }
 
 cv::Mat DenseStereoMatcher::ConvertToGrayscale(const cv::Mat& image) const
@@ -44,19 +45,19 @@ DenseMatchingResult DenseStereoMatcher::BuildResult(const cv::Mat& rawDisparity,
         invalid sentinel (~minDisparity - 1) is far from real values, so a small
         kernel does not pull valid pixels toward it noticeably.
     */
-    if (config.medianKernel >= 3 && config.medianKernel % 2 == 1)
+    if (config.openCv.medianKernel >= 3 && config.openCv.medianKernel % 2 == 1)
     {
-        cv::medianBlur(result.rawDisparity, result.rawDisparity, config.medianKernel);
+        cv::medianBlur(result.rawDisparity, result.rawDisparity, config.openCv.medianKernel);
     }
 
-    result.validDisparityMask = result.rawDisparity > static_cast<float>(config.minDisparity);
+    result.validDisparityMask = result.rawDisparity > static_cast<float>(config.openCv.minDisparity);
 
     // Diagnostic: detect when numDisparities clips the scene (real disparities
     // piling up at the upper search bound -> raise numDisparities to recover them).
     double minVal = 0.0;
     double maxVal = 0.0;
     cv::minMaxLoc(result.rawDisparity, &minVal, &maxVal, nullptr, nullptr, result.validDisparityMask);
-    const int searchTop = config.minDisparity + config.numDisparities;
+    const int searchTop = config.openCv.minDisparity + config.openCv.numDisparities;
     std::cout << "Disparity range observed: [" << minVal << ", " << maxVal << "] px (search window up to "
         << searchTop << ").";
     if (maxVal >= searchTop - 1)
@@ -73,19 +74,19 @@ DenseMatchingResult DenseStereoMatcher::BuildResult(const cv::Mat& rawDisparity,
 cv::Mat DenseStereoMatcher::ComputeSgbmDisparity(const cv::Mat& leftImage, const cv::Mat& rightImage, const cv::Mat& leftGuide, const DenseStereoConfig& config, cv::Mat& confidenceMapOut) const
 {
 	confidenceMapOut.release();
-    const int p1 = config.p1 > 0 ? config.p1 : 8 * config.blockSize * config.blockSize;
-    const int p2 = config.p2 > 0 ? config.p2 : 32 * config.blockSize * config.blockSize;
+    const int p1 = config.openCv.p1 > 0 ? config.openCv.p1 : 8 * config.openCv.blockSize * config.openCv.blockSize;
+    const int p2 = config.openCv.p2 > 0 ? config.openCv.p2 : 32 * config.openCv.blockSize * config.openCv.blockSize;
 
-    cv::Ptr<cv::StereoSGBM> matcher = cv::StereoSGBM::create(config.minDisparity, config.numDisparities, config.blockSize, p1, p2);
-    matcher->setUniquenessRatio(config.uniquenessRatio);
-    matcher->setSpeckleWindowSize(config.speckleWindowSize);
-    matcher->setSpeckleRange(config.speckleRange);
-    matcher->setDisp12MaxDiff(config.disp12MaxDiff);
-    matcher->setPreFilterCap(config.preFilterCap);
+    cv::Ptr<cv::StereoSGBM> matcher = cv::StereoSGBM::create(config.openCv.minDisparity, config.openCv.numDisparities, config.openCv.blockSize, p1, p2);
+    matcher->setUniquenessRatio(config.openCv.uniquenessRatio);
+    matcher->setSpeckleWindowSize(config.openCv.speckleWindowSize);
+    matcher->setSpeckleRange(config.openCv.speckleRange);
+    matcher->setDisp12MaxDiff(config.openCv.disp12MaxDiff);
+    matcher->setPreFilterCap(config.openCv.preFilterCap);
     matcher->setMode(cv::StereoSGBM::MODE_SGBM_3WAY);
 
 #ifdef HAVE_OPENCV_XIMGPROC
-    if (config.useWlsFilter)
+    if (config.openCv.useWlsFilter)
     {
         /*
             Weighted-least-squares filtering: smooth the disparity while snapping
@@ -102,23 +103,21 @@ cv::Mat DenseStereoMatcher::ComputeSgbmDisparity(const cv::Mat& leftImage, const
         matcher->compute(leftImage, rightImage, leftDisparity);
         rightMatcher->compute(rightImage, leftImage, rightDisparity);
 
-        wls->setLambda(config.wlsLambda);
-        wls->setSigmaColor(config.wlsSigma);
+        wls->setLambda(config.openCv.wlsLambda);
+        wls->setSigmaColor(config.openCv.wlsSigma);
 
         cv::Mat filteredDisparity;
         wls->filter(leftDisparity, leftGuide, filteredDisparity, rightDisparity);
         confidenceMapOut = wls->getConfidenceMap(); // CV_32F, 0..255
 
-        std::cout << "WLS disparity filtering applied (lambda=" << config.wlsLambda
-            << ", sigma=" << config.wlsSigma << ")." << std::endl;
+        std::cout << "WLS disparity filtering applied (lambda=" << config.openCv.wlsLambda << ", sigma=" << config.openCv.wlsSigma << ")." << std::endl;
         return filteredDisparity;
     }
 #else
     (void)leftGuide;
-    if (config.useWlsFilter)
+    if (config.openCv.useWlsFilter)
     {
-        std::cout << "WLS requested but this build lacks opencv_ximgproc; using unfiltered SGBM. "
-            << "Install opencv4[contrib] to enable it." << std::endl;
+        std::cout << "WLS requested but this build lacks opencv_ximgproc; using unfiltered SGBM. " << "Install opencv4[contrib] to enable it." << std::endl;
     }
 #endif
 
@@ -131,12 +130,12 @@ DenseMatchingResult DenseStereoMatcher::ComputeDisparity(const RectificationResu
 {
     std::cout << "Disparity map computation started." << std::endl;
 
-    if (config.numDisparities <= 0 || config.numDisparities % 16 != 0)
+    if (config.openCv.numDisparities <= 0 || config.openCv.numDisparities % 16 != 0)
     {
         throw std::runtime_error("numDisparities must be a positive multiple of 16.");
     }
 
-    if (config.blockSize <= 0 || config.blockSize % 2 == 0)
+    if (config.openCv.blockSize <= 0 || config.openCv.blockSize % 2 == 0)
     {
         throw std::runtime_error("blockSize must be a positive odd number.");
     }
@@ -147,11 +146,11 @@ DenseMatchingResult DenseStereoMatcher::ComputeDisparity(const RectificationResu
     cv::Mat rawDisparity;
     cv::Mat confidenceMap;
 
-    if (config.method == DenseStereoMethod::StereoBM)
+    if (config.openCv.method == DenseStereoMethod::StereoBM)
     {
-        cv::Ptr<cv::StereoBM> matcher = cv::StereoBM::create(config.numDisparities, config.blockSize);
-        matcher->setMinDisparity(config.minDisparity);
-        matcher->compute(rightImage, leftImage, rawDisparity);
+        cv::Ptr<cv::StereoBM> matcher = cv::StereoBM::create(config.openCv.numDisparities, config.openCv.blockSize);
+        matcher->setMinDisparity(config.openCv.minDisparity);
+        matcher->compute(leftImage, rightImage, rawDisparity);
     }
     else
     {
@@ -167,13 +166,13 @@ DenseMatchingResult DenseStereoMatcher::ComputeDisparity(const RectificationResu
         Drop WLS-extrapolated pixels below the confidence threshold so the valid
         mask reflects actually-matched geometry rather than the smooth fill.
     */
-    if (!confidenceMap.empty() && config.wlsConfidenceThreshold > 0.0f)
+    if (!confidenceMap.empty() && config.openCv.wlsConfidenceThreshold > 0.0f)
     {
         const int beforeCount = cv::countNonZero(result.validDisparityMask);
-        cv::Mat confidentMask = confidenceMap >= (config.wlsConfidenceThreshold * 255.0f);
+        cv::Mat confidentMask = confidenceMap >= (config.openCv.wlsConfidenceThreshold * 255.0f);
         cv::bitwise_and(result.validDisparityMask, confidentMask, result.validDisparityMask);
         const int afterCount = cv::countNonZero(result.validDisparityMask);
-        std::cout << "WLS confidence gate (>= " << config.wlsConfidenceThreshold << "): kept "
+        std::cout << "WLS confidence gate (>= " << config.openCv.wlsConfidenceThreshold << "): kept "
             << afterCount << " / " << beforeCount << " disparities." << std::endl;
     }
 

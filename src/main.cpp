@@ -2,6 +2,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <optional>
 
 #include "DataLoader.h"
 #include "SparseFeatureMatcher.h"
@@ -13,10 +14,10 @@
 
 int main()
 {
-	const std::filesystem::path outputDir = "out";
+	const std::filesystem::path outputDir = "../out";
 	std::filesystem::create_directories(outputDir);
 
-	DataLoader dataLoader("data/delivery_area/");
+	DataLoader dataLoader("../data/delivery_area/");
 	StereoImagePair imagePair = dataLoader.LoadStereoPair("images/dslr_images_undistorted/DSC_0688.jpg", "images/dslr_images_undistorted/DSC_0689.jpg");
 	//imagePair.ShowResized(0.15);
 
@@ -107,13 +108,16 @@ int main()
 	struct BackendRun
 	{
 		DenseStereoBackend backend;
+		std::optional<CustomCostMetric> costMetric;
 		std::string tag;
 		const char* label;
 	};
 
 	const std::vector<BackendRun> runs = {
-		{ DenseStereoBackend::OpenCv, "opencv", "OpenCV StereoSGBM (+WLS)" },
-		{ DenseStereoBackend::Custom, "custom", "Custom NCC block matcher" },
+	{ DenseStereoBackend::OpenCv, std::nullopt, "opencv", "OpenCV StereoSGBM (+WLS)" },
+	{ DenseStereoBackend::Custom, CustomCostMetric::NCC, "NCC", "Custom NCC block matcher" },
+	{ DenseStereoBackend::Custom, CustomCostMetric::SSD, "SSD", "Custom SSD block matcher" },
+	{ DenseStereoBackend::Custom, CustomCostMetric::Census, "Census", "Custom Census matcher" },
 	};
 
 	DepthReconstructor depthReconstructor;
@@ -125,9 +129,14 @@ int main()
 
 		DenseStereoConfig denseConfig;
 		denseConfig.backend = run.backend;
-		denseConfig.method = DenseStereoMethod::StereoSGBM; // used only by the OpenCV backend
+		denseConfig.openCv.method = DenseStereoMethod::StereoSGBM; // used only by the OpenCV backend
 
-		std::unique_ptr<IDenseStereoMatcher> matcher = CreateDenseMatcher(run.backend);
+		if (run.costMetric.has_value())
+		{
+			denseConfig.customCost.metric = run.costMetric.value();
+		}
+
+		std::unique_ptr<IDenseStereoMatcher> matcher = CreateDenseMatcher(denseConfig);
 		DenseMatchingResult denseResult = matcher->ComputeDisparity(rectResult, denseConfig);
 
 		// Disparity outputs (tagged per backend).
@@ -183,6 +192,7 @@ int main()
 			if (run.backend == DenseStereoBackend::Custom && !denseResult.matchedMask.empty())
 			{
 				ReconstructionResult matchedReconstruction = reconstruction; // shares points3D/colors; validMask replaced below
+				matchedReconstruction.validMask = reconstruction.validMask.clone();
 				cv::bitwise_and(reconstruction.validMask, denseResult.matchedMask, matchedReconstruction.validMask);
 
 				if (matchedReconstruction.ValidPointCount() > 0)
@@ -209,8 +219,8 @@ int main()
 						? 0.02f * static_cast<float>(sumZ / meshVertexCount)
 						: depthConfig.maxMeshEdgeDepthDiff;
 
-					matchedReconstruction.WritePointCloudPly(outputDir / "pointcloud_custom_matched.ply", depthConfig.exportGridStep);
-					matchedReconstruction.WriteMeshPly(outputDir / "mesh_custom_matched.ply", denseMeshEdgeDepthDiff, depthConfig.exportGridStep);
+					matchedReconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + run.tag + "_matched.ply"), depthConfig.exportGridStep);
+					matchedReconstruction.WriteMeshPly(outputDir / ("mesh_" + run.tag + "_matched.ply"), denseMeshEdgeDepthDiff, depthConfig.exportGridStep);
 				}
 			}
 		}
