@@ -114,10 +114,10 @@ int main()
 	};
 
 	const std::vector<BackendRun> runs = {
-	{ DenseStereoBackend::OpenCv, std::nullopt, "opencv", "OpenCV StereoSGBM (+WLS)" },
-	{ DenseStereoBackend::Custom, CustomCostMetric::NCC, "NCC", "Custom NCC block matcher" },
-	{ DenseStereoBackend::Custom, CustomCostMetric::SSD, "SSD", "Custom SSD block matcher" },
-	{ DenseStereoBackend::Custom, CustomCostMetric::Census, "Census", "Custom Census matcher" },
+		{ DenseStereoBackend::OpenCv, std::nullopt, "opencv", "OpenCV StereoSGBM (+WLS)" },
+		{ DenseStereoBackend::Custom, CustomCostMetric::NCC, "NCC", "Custom NCC block matcher" },
+		{ DenseStereoBackend::Custom, CustomCostMetric::SSD, "SSD", "Custom SSD block matcher" },
+		{ DenseStereoBackend::Custom, CustomCostMetric::Census, "Census", "Custom Census matcher" }
 	};
 
 	DepthReconstructor depthReconstructor;
@@ -139,28 +139,6 @@ int main()
 		std::unique_ptr<IDenseStereoMatcher> matcher = CreateDenseMatcher(denseConfig);
 		DenseMatchingResult denseResult = matcher->ComputeDisparity(rectResult, denseConfig);
 
-		// Disparity outputs (tagged per backend).
-		cv::imwrite((outputDir / ("disparity_" + run.tag + "_float.tiff")).string(), denseResult.rawDisparity);
-		cv::imwrite((outputDir / ("valid_disparity_" + run.tag + "_mask.tiff")).string(), denseResult.validDisparityMask);
-
-		// Custom-backend diagnostics: the pre-fill matched mask (honest, fill-free
-		// coverage) and the pre-fill failure-reason map (raw indexed 0..4 PNG that
-		// scripts/evaluate_depth.py colors and tabulates). Only the custom backend
-		// populates these, so guard on non-empty.
-		if (!denseResult.matchedMask.empty())
-		{
-			cv::imwrite((outputDir / ("valid_matched_" + run.tag + "_mask.tiff")).string(), denseResult.matchedMask);
-		}
-		if (!denseResult.failureReason.empty())
-		{
-			cv::imwrite((outputDir / ("reason_" + run.tag + ".png")).string(), denseResult.failureReason);
-		}
-
-		cv::Mat disparityColored;
-		cv::applyColorMap(denseResult.disparityVisualization, disparityColored, cv::COLORMAP_JET);
-		disparityColored.setTo(cv::Scalar(0, 0, 0), ~denseResult.validDisparityMask);
-		cv::imwrite((outputDir / ("disparity_" + run.tag + "_colored.png")).string(), disparityColored);
-
 		// Depth -> colored point cloud + mesh (identical tail for both backends).
 		DepthReconstructionConfig depthConfig;
 		depthConfig.metricBaseline = metricBaseline; // metric baseline recovered from the ETH3D poses
@@ -171,63 +149,75 @@ int main()
 		// MeshLab-safe on an old PC.
 		depthConfig.exportGridStep = 2;
 
-		ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, denseResult, depthConfig);
-		reconstruction.WriteDepthMapTiff(outputDir, run.tag);
-		reconstruction.PrintStats();
-
-		if (reconstruction.ValidPointCount() > 0)
+		if (!denseResult.failureReason.empty())
 		{
-			reconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + run.tag + ".ply"), depthConfig.exportGridStep);
-			reconstruction.WriteMeshPly(outputDir / ("mesh_" + run.tag + ".ply"), depthConfig.maxMeshEdgeDepthDiff, depthConfig.exportGridStep);
+			cv::imwrite((outputDir / ("reason_" + run.tag + ".png")).string(), denseResult.failureReason);
+		}
 
-			/*
-				Custom backend only: also export the fill-free "matched-only" variant.
-				~60% of the dense map's valid pixels are directional-fill interpolations
-				(smooth, no fine detail); denseResult.matchedMask marks the ~36% that were
-				genuinely matched. Restricting the reconstruction to (validMask AND
-				matchedMask) gives a crisp point cloud / mesh that surfaces the honest
-				geometry alongside the dense fill. Only validMask differs, so a shallow
-				copy of the result (sharing points3D/colors) is the least invasive path.
-			*/
-			if (run.backend == DenseStereoBackend::Custom && !denseResult.matchedMask.empty())
+		const auto writeColoredDisparity = [&](const std::string& stage, const cv::Mat& disparity, const cv::Mat& validMask)
 			{
-				ReconstructionResult matchedReconstruction = reconstruction; // shares points3D/colors; validMask replaced below
-				matchedReconstruction.validMask = reconstruction.validMask.clone();
-				cv::bitwise_and(reconstruction.validMask, denseResult.matchedMask, matchedReconstruction.validMask);
-
-				if (matchedReconstruction.ValidPointCount() > 0)
+				if (disparity.empty() || validMask.empty())
 				{
-					/*
-						Reuse the exact discontinuity threshold the dense mesh derived
-						(0.02 * meanZ over its valid strided vertices, see WriteMeshPly) so the
-						two meshes are directly comparable. Deriving it inside WriteMeshPly from
-						the matched-only subset would use a slightly different meanZ.
-					*/
-					const int stride = std::max(1, depthConfig.exportGridStep);
-					double sumZ = 0.0;
-					int meshVertexCount = 0;
-					for (int row = 0; row < reconstruction.points3D.rows; row += stride)
-					{
-						for (int col = 0; col < reconstruction.points3D.cols; col += stride)
-						{
-							if (reconstruction.validMask.at<unsigned char>(row, col) == 0) { continue; }
-							sumZ += reconstruction.points3D.at<cv::Vec3f>(row, col)[2];
-							++meshVertexCount;
-						}
-					}
-					const float denseMeshEdgeDepthDiff = meshVertexCount > 0
-						? 0.02f * static_cast<float>(sumZ / meshVertexCount)
-						: depthConfig.maxMeshEdgeDepthDiff;
-
-					matchedReconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + run.tag + "_matched.ply"), depthConfig.exportGridStep);
-					matchedReconstruction.WriteMeshPly(outputDir / ("mesh_" + run.tag + "_matched.ply"), denseMeshEdgeDepthDiff, depthConfig.exportGridStep);
+					return;
 				}
-			}
+
+				cv::Mat visualization;
+				cv::normalize(disparity, visualization, 0, 255, cv::NORM_MINMAX, CV_8U, validMask);
+
+				cv::Mat colored;
+				cv::applyColorMap(visualization, colored, cv::COLORMAP_JET);
+				colored.setTo(cv::Scalar(0, 0, 0), ~validMask);
+
+				cv::imwrite((outputDir / ("disparity_" + run.tag + "_" + stage + "_colored.png")).string(), colored);
+			};
+
+		const auto reconstructAndExport = [&](const std::string& stage, const cv::Mat& disparity, const cv::Mat& validMask)
+			{
+				const std::string outputTag = run.tag + "_" + stage;
+
+				std::cout << "\n--- Reconstruction stage: " << outputTag << " ---" << std::endl;
+
+				ReconstructionResult reconstruction = depthReconstructor.Reconstruct(rectResult, disparity, validMask, depthConfig);
+
+				reconstruction.WriteDepthMapTiff(outputDir, outputTag);
+				reconstruction.PrintStats();
+
+				if (reconstruction.ValidPointCount() == 0)
+				{
+					std::cout << "No valid 3D points for '" << outputTag << "'; skipping point cloud and mesh export." << std::endl;
+					return;
+				}
+
+				reconstruction.WritePointCloudPly(outputDir / ("pointcloud_" + outputTag + ".ply"), depthConfig.exportGridStep);
+				reconstruction.WriteMeshPly(outputDir / ("mesh_" + outputTag + ".ply"), depthConfig.maxMeshEdgeDepthDiff, depthConfig.exportGridStep);
+			};
+
+		if (run.backend == DenseStereoBackend::Custom)
+		{
+			cv::imwrite((outputDir / ("disparity_" + run.tag + "_raw_float.tiff")).string(), denseResult.rawDisparity);
+			cv::imwrite((outputDir / ("valid_disparity_" + run.tag + "_raw_mask.tiff")).string(), denseResult.rawValidMask);
+
+			cv::imwrite((outputDir / ("disparity_" + run.tag + "_filtered_float.tiff")).string(), denseResult.filteredDisparity);
+			cv::imwrite((outputDir / ("valid_disparity_" + run.tag + "_filtered_mask.tiff")).string(), denseResult.filteredValidMask);
+
+			cv::imwrite((outputDir / ("disparity_" + run.tag + "_filled_float.tiff")).string(), denseResult.filledDisparity);
+			cv::imwrite((outputDir / ("valid_disparity_" + run.tag + "_filled_mask.tiff")).string(), denseResult.filledValidMask);
+
+			writeColoredDisparity("raw", denseResult.rawDisparity, denseResult.rawValidMask);
+			writeColoredDisparity("filtered", denseResult.filteredDisparity, denseResult.filteredValidMask);
+			writeColoredDisparity("filled", denseResult.filledDisparity, denseResult.filledValidMask);
+
+			reconstructAndExport("raw", denseResult.rawDisparity, denseResult.rawValidMask);
+			reconstructAndExport("filtered", denseResult.filteredDisparity, denseResult.filteredValidMask);
+			reconstructAndExport("filled", denseResult.filledDisparity, denseResult.filledValidMask);
 		}
 		else
 		{
-			std::cout << "No valid 3D points were reconstructed for backend '" << run.tag
-				<< "'; skipping point cloud and mesh export." << std::endl;
+			cv::imwrite((outputDir / ("disparity_" + run.tag + "_float.tiff")).string(), denseResult.filledDisparity);
+			cv::imwrite((outputDir / ("valid_disparity_" + run.tag + "_mask.tiff")).string(), denseResult.filledValidMask);
+
+			writeColoredDisparity("final", denseResult.filledDisparity, denseResult.filledValidMask);
+			reconstructAndExport("final", denseResult.filledDisparity, denseResult.filledValidMask);
 		}
 	}
 

@@ -1585,6 +1585,9 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 		std::cout << "Custom matcher: left-right consistency rejected " << rejected << " pixels." << std::endl;
 	}
 
+	const cv::Mat rawDisparityWork = disparityWork.clone();
+	const cv::Mat rawValidMaskWork = disparityWork > kInvalidDisparity;
+
 	// Post-filtering at final working resolution (our own implementations).
 	cv::Mat maskWork = disparityWork > kInvalidDisparity;
 	ValidMedianFilter(disparityWork, maskWork, config.custom.medianKernel);
@@ -1596,9 +1599,8 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	maskWork = disparityWork > kInvalidDisparity;
 	reasonWork.setTo(CustomMatchReasonSpeckle, maskBeforeSpeckle & ~maskWork);
 
-	// Snapshot the genuinely-matched mask before filling: this is the honest,
-	// fill-free coverage exported for evaluation as matchedMask.
-	const cv::Mat matchedMaskWork = maskWork.clone();
+	const cv::Mat filteredDisparityWork = disparityWork.clone();
+	const cv::Mat filteredValidMaskWork = maskWork.clone();
 
 	/*
 		Occlusion-aware densification. FillHolesDirectional turns holes with enough
@@ -1636,45 +1638,74 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 		}
 	}
 
+	const cv::Mat filledDisparityWork = disparityWork.clone();
+	const cv::Mat filledValidMaskWork = maskWork.clone();
+
 	// Upscale the final working disparity to full resolution. With the finest level
 	// at config.custom.finalDownscale this is only a small nearest-neighbour step,
 	// which keeps the invalid sentinel distinct (no interpolation of valid into
 	// invalid).
 	const cv::Size fullSize = leftFullGray.size();
-	cv::Mat disparityFull;
-	cv::Mat maskFull;
-	cv::resize(disparityWork, disparityFull, fullSize, 0, 0, cv::INTER_NEAREST);
-	cv::resize(maskWork, maskFull, fullSize, 0, 0, cv::INTER_NEAREST);
+
+	cv::Mat rawDisparityFull;
+	cv::Mat rawValidMaskFull;
+	cv::resize(rawDisparityWork, rawDisparityFull, fullSize, 0, 0, cv::INTER_NEAREST);
+	cv::resize(rawValidMaskWork, rawValidMaskFull, fullSize, 0, 0, cv::INTER_NEAREST);
+
+	cv::Mat filteredDisparityFull;
+	cv::Mat filteredValidMaskFull;
+	cv::resize(filteredDisparityWork, filteredDisparityFull, fullSize, 0, 0, cv::INTER_NEAREST);
+	cv::resize(filteredValidMaskWork, filteredValidMaskFull, fullSize, 0, 0, cv::INTER_NEAREST);
+
+	cv::Mat filledDisparityFull;
+	cv::Mat filledValidMaskFull;
+	cv::resize(filledDisparityWork, filledDisparityFull, fullSize, 0, 0, cv::INTER_NEAREST);
+	cv::resize(filledValidMaskWork, filledValidMaskFull, fullSize, 0, 0, cv::INTER_NEAREST);
 
 	// Diagnostics at full resolution: the pre-fill matched mask and the pre-fill
 	// reason map, nearest-upscaled to keep their discrete labels intact.
-	cv::Mat matchedMaskFull;
 	cv::Mat reasonFull;
-	cv::resize(matchedMaskWork, matchedMaskFull, fullSize, 0, 0, cv::INTER_NEAREST);
 	cv::resize(reasonWork, reasonFull, fullSize, 0, 0, cv::INTER_NEAREST);
 
 	// Disparity scales with image width: a disparity of d at the finest working
 	// resolution corresponds to d / finalScale full-resolution pixels.
 	if (finalScale < 1.0)
 	{
-		disparityFull *= static_cast<float>(1.0 / finalScale);
+		const float disparityScale = static_cast<float>(1.0 / finalScale);
+
+		rawDisparityFull *= disparityScale;
+		filteredDisparityFull *= disparityScale;
+		filledDisparityFull *= disparityScale;
 	}
-	disparityFull.setTo(kInvalidDisparity, ~maskFull);
+
+	rawDisparityFull.setTo(kInvalidDisparity, ~rawValidMaskFull);
+	filteredDisparityFull.setTo(kInvalidDisparity, ~filteredValidMaskFull);
+	filledDisparityFull.setTo(kInvalidDisparity, ~filledValidMaskFull);
 
 	DenseMatchingResult result;
-	result.rawDisparity = disparityFull;
-	result.validDisparityMask = maskFull;
-	result.matchedMask = matchedMaskFull;
+
+	result.rawDisparity = rawDisparityFull;
+	result.rawValidMask = rawValidMaskFull;
+
+	result.filteredDisparity = filteredDisparityFull;
+	result.filteredValidMask = filteredValidMaskFull;
+
+	result.filledDisparity = filledDisparityFull;
+	result.filledValidMask = filledValidMaskFull;
+
 	result.failureReason = reasonFull;
-	cv::normalize(result.rawDisparity, result.disparityVisualization, 0, 255, cv::NORM_MINMAX, CV_8U, result.validDisparityMask);
+
+	cv::normalize(result.filledDisparity, result.disparityVisualization, 0, 255, cv::NORM_MINMAX, CV_8U, result.filledValidMask);
 
 	double minVal = 0.0;
 	double maxVal = 0.0;
-	cv::minMaxLoc(result.rawDisparity, &minVal, &maxVal, nullptr, nullptr, result.validDisparityMask);
-	std::cout << "Custom disparity range observed: [" << minVal << ", " << maxVal << "] full-res px. Kept "
-		<< cv::countNonZero(result.validDisparityMask) << " / " << (fullSize.width * fullSize.height)
-		<< " pixels." << std::endl;
-	std::cout << "Custom hierarchical " << metricName << " disparity computation finished successfully." << std::endl;
+	cv::minMaxLoc(result.filledDisparity, &minVal, &maxVal, nullptr, nullptr, result.filledValidMask);
+
+	std::cout << "Custom disparity range observed: [" << minVal << ", " << maxVal << "] full-res px." << std::endl;
+
+	std::cout << "Raw valid: " << cv::countNonZero(result.rawValidMask) << std::endl;
+	std::cout << "Filtered valid: " << cv::countNonZero(result.filteredValidMask) << std::endl;
+	std::cout << "Filled valid: " << cv::countNonZero(result.filledValidMask) << std::endl;
 
 	return result;
 }

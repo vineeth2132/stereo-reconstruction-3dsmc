@@ -105,23 +105,25 @@ cv::Mat DepthReconstructor::ConvertQToOpenCv(const Eigen::Matrix4d& reprojection
 	return result;
 }
 
-ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& rectificationResult, const DenseMatchingResult& denseResult, const DepthReconstructionConfig& config) const
+ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& rectificationResult, const cv::Mat& disparity,
+													 const cv::Mat& validDisparityMask, const DepthReconstructionConfig& config) const
 {
 	std::cout << "Depth reconstruction started." << std::endl;
 
-	if (denseResult.rawDisparity.empty()) { throw std::runtime_error("Cannot reconstruct from an empty disparity map."); }
+	if (disparity.empty()) { throw std::runtime_error("Cannot reconstruct from an empty disparity map."); }
+	if (validDisparityMask.empty()) { throw std::runtime_error("Cannot reconstruct without a valid disparity mask."); }
 	if (rectificationResult.rectifiedLeftImage.empty()) { throw std::runtime_error("Cannot reconstruct without the rectified left image for color."); }
-	if (denseResult.rawDisparity.size() != rectificationResult.rectifiedLeftImage.size())
-	{
-		throw std::runtime_error("Disparity map and rectified left image must have equal dimensions.");
-	}
+	if (disparity.size() != validDisparityMask.size()) { throw std::runtime_error("Disparity map and validity mask must have equal dimensions."); }
+	if (disparity.size() != rectificationResult.rectifiedLeftImage.size()) { throw std::runtime_error("Disparity map and rectified left image must have equal dimensions."); }
+	if (disparity.type() != CV_32F) { throw std::runtime_error("Disparity map must have type CV_32F."); }
+	if (validDisparityMask.type() != CV_8U) { throw std::runtime_error("Validity mask must have type CV_8U."); }
 
 	const cv::Mat reprojectionMatrixQ = ConvertQToOpenCv(rectificationResult.reprojectionMatrixQ);
 
 	cv::Mat points3D;
 	if (config.backend == DepthBackend::OpenCv)
 	{
-		cv::reprojectImageTo3D(denseResult.rawDisparity, points3D, reprojectionMatrixQ, true, CV_32F);
+		cv::reprojectImageTo3D(disparity, points3D, reprojectionMatrixQ, true, CV_32F);
 	}
 	else
 	{
@@ -134,7 +136,7 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 		const Eigen::Matrix4d& Q = rectificationResult.reprojectionMatrixQ;
 		const float missingSentinel = 10000.0f;
 
-		points3D.create(denseResult.rawDisparity.size(), CV_32FC3);
+		points3D.create(disparity.size(), CV_32FC3);
 
 		for (int row = 0; row < points3D.rows; ++row)
 		{
@@ -142,7 +144,7 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 			{
 				cv::Vec3f& out = points3D.at<cv::Vec3f>(row, col);
 
-				if (denseResult.validDisparityMask.at<unsigned char>(row, col) == 0)
+				if (validDisparityMask.at<unsigned char>(row, col) == 0)
 				{
 					out = cv::Vec3f(missingSentinel, missingSentinel, missingSentinel);
 					continue;
@@ -150,7 +152,7 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 
 				const double x = static_cast<double>(col);
 				const double y = static_cast<double>(row);
-				const double d = static_cast<double>(denseResult.rawDisparity.at<float>(row, col));
+				const double d = static_cast<double>(disparity.at<float>(row, col));
 
 				const double X = Q(0, 0) * x + Q(0, 1) * y + Q(0, 2) * d + Q(0, 3);
 				const double Y = Q(1, 0) * x + Q(1, 1) * y + Q(1, 2) * d + Q(1, 3);
@@ -172,7 +174,7 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 		if (config.validateAgainstOpenCv)
 		{
 			cv::Mat reference;
-			cv::reprojectImageTo3D(denseResult.rawDisparity, reference, reprojectionMatrixQ, true, CV_32F);
+			cv::reprojectImageTo3D(disparity, reference, reprojectionMatrixQ, true, CV_32F);
 
 			double maxDiff = 0.0;
 			int comparedCount = 0;
@@ -180,7 +182,7 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 			{
 				for (int col = 0; col < points3D.cols; ++col)
 				{
-					if (denseResult.validDisparityMask.at<unsigned char>(row, col) == 0) { continue; }
+					if (validDisparityMask.at<unsigned char>(row, col) == 0) { continue; }
 
 					const cv::Vec3f& ours = points3D.at<cv::Vec3f>(row, col);
 					const cv::Vec3f& ref = reference.at<cv::Vec3f>(row, col);
@@ -226,7 +228,7 @@ ReconstructionResult DepthReconstructor::Reconstruct(const RectificationResult& 
 	{
 		for (int col = 0; col < points3D.cols; ++col)
 		{
-			if (denseResult.validDisparityMask.at<unsigned char>(row, col) == 0) { continue; }
+			if (validDisparityMask.at<unsigned char>(row, col) == 0) { continue; }
 			++dispValidCount;
 
 			const cv::Vec3f point = points3D.at<cv::Vec3f>(row, col);

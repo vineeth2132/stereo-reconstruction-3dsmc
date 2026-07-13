@@ -79,7 +79,7 @@ struct ReconstructionResult
 class DepthReconstructor
 {
 public:
-	ReconstructionResult Reconstruct(const RectificationResult& rectificationResult, const DenseMatchingResult& denseResult, const DepthReconstructionConfig& config) const;
+	ReconstructionResult Reconstruct(const RectificationResult& rectificationResult, const cv::Mat& disparity, const cv::Mat& validDisparityMask, const DepthReconstructionConfig& config) const;
 
 private:
 	cv::Mat ConvertQToOpenCv(const Eigen::Matrix4d& reprojectionMatrixQ) const;

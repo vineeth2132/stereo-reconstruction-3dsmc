@@ -38,7 +38,7 @@ DenseMatchingResult DenseStereoMatcher::BuildResult(const cv::Mat& rawDisparity,
         OpenCV stores BM and SGBM disparities as fixed-point values
         scaled by 16. Convert them to actual pixel disparities.
     */
-    rawDisparity.convertTo(result.rawDisparity, CV_32F, 1.0 / 16.0);
+    rawDisparity.convertTo(result.filledDisparity, CV_32F, 1.0 / 16.0);
 
     /*
         Median blur removes isolated salt-and-pepper disparities cheaply. The
@@ -47,16 +47,16 @@ DenseMatchingResult DenseStereoMatcher::BuildResult(const cv::Mat& rawDisparity,
     */
     if (config.openCv.medianKernel >= 3 && config.openCv.medianKernel % 2 == 1)
     {
-        cv::medianBlur(result.rawDisparity, result.rawDisparity, config.openCv.medianKernel);
+        cv::medianBlur(result.filledDisparity, result.filledDisparity, config.openCv.medianKernel);
     }
 
-    result.validDisparityMask = result.rawDisparity > static_cast<float>(config.openCv.minDisparity);
+    result.filledValidMask = result.filledDisparity > static_cast<float>(config.openCv.minDisparity);
 
     // Diagnostic: detect when numDisparities clips the scene (real disparities
     // piling up at the upper search bound -> raise numDisparities to recover them).
     double minVal = 0.0;
     double maxVal = 0.0;
-    cv::minMaxLoc(result.rawDisparity, &minVal, &maxVal, nullptr, nullptr, result.validDisparityMask);
+    cv::minMaxLoc(result.filledDisparity, &minVal, &maxVal, nullptr, nullptr, result.filledValidMask);
     const int searchTop = config.openCv.minDisparity + config.openCv.numDisparities;
     std::cout << "Disparity range observed: [" << minVal << ", " << maxVal << "] px (search window up to "
         << searchTop << ").";
@@ -66,7 +66,13 @@ DenseMatchingResult DenseStereoMatcher::BuildResult(const cv::Mat& rawDisparity,
     }
     std::cout << std::endl;
 
-    cv::normalize(result.rawDisparity, result.disparityVisualization, 0, 255, cv::NORM_MINMAX, CV_8U, result.validDisparityMask);
+    cv::normalize(result.filledDisparity, result.disparityVisualization, 0, 255, cv::NORM_MINMAX, CV_8U, result.filledValidMask);
+
+    result.rawDisparity = result.filledDisparity.clone();
+    result.rawValidMask = result.filledValidMask.clone();
+
+    result.filteredDisparity = result.filledDisparity.clone();
+    result.filteredValidMask = result.filledValidMask.clone();
 
     return result;
 }
@@ -168,10 +174,10 @@ DenseMatchingResult DenseStereoMatcher::ComputeDisparity(const RectificationResu
     */
     if (!confidenceMap.empty() && config.openCv.wlsConfidenceThreshold > 0.0f)
     {
-        const int beforeCount = cv::countNonZero(result.validDisparityMask);
+        const int beforeCount = cv::countNonZero(result.filledValidMask);
         cv::Mat confidentMask = confidenceMap >= (config.openCv.wlsConfidenceThreshold * 255.0f);
-        cv::bitwise_and(result.validDisparityMask, confidentMask, result.validDisparityMask);
-        const int afterCount = cv::countNonZero(result.validDisparityMask);
+        cv::bitwise_and(result.filledValidMask, confidentMask, result.filledValidMask);
+        const int afterCount = cv::countNonZero(result.filledValidMask);
         std::cout << "WLS confidence gate (>= " << config.openCv.wlsConfidenceThreshold << "): kept "
             << afterCount << " / " << beforeCount << " disparities." << std::endl;
     }
@@ -188,7 +194,7 @@ void DenseMatchingResult::ShowDisparity() const
 
     cv::Mat coloredDisparity;
     cv::applyColorMap(disparityVisualization, coloredDisparity, cv::COLORMAP_JET);
-    coloredDisparity.setTo(cv::Scalar(0, 0, 0), ~validDisparityMask);
+    coloredDisparity.setTo(cv::Scalar(0, 0, 0), ~filledValidMask);
 
     cv::namedWindow("Disparity Map", cv::WINDOW_NORMAL);
     cv::resizeWindow("Disparity Map", 1200, 800);

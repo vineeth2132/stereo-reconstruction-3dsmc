@@ -334,39 +334,18 @@ enum CustomMatchReason : unsigned char
 	CustomMatchReasonSpeckle = 4       // Removed by the custom speckle filter.
 };
 
-/*
-	Output of a dense-stereo matcher.
-
-	All backends return a full-resolution disparity map and validity mask.
-	The custom backend additionally populates matchedMask and failureReason.
-*/
 struct DenseMatchingResult
 {
-	/*
-		Full-resolution disparity map in pixel units.
-	*/
 	cv::Mat rawDisparity;
+	cv::Mat rawValidMask;
 
-	/*
-		Normalized 8-bit disparity image used for visualization.
-	*/
+	cv::Mat filteredDisparity;
+	cv::Mat filteredValidMask;
+
+	cv::Mat filledDisparity;
+	cv::Mat filledValidMask;
+
 	cv::Mat disparityVisualization;
-
-	/*
-		CV_8U mask indicating which rawDisparity pixels are valid.
-	*/
-	cv::Mat validDisparityMask;
-
-	/*
-		Custom-backend diagnostics.
-
-		matchedMask:
-			Pixels that were genuinely matched before hole filling.
-
-		failureReason:
-			Pre-fill rejection reason encoded using CustomMatchReason.
-	*/
-	cv::Mat matchedMask;
 	cv::Mat failureReason;
 
 	void ShowDisparity() const;
