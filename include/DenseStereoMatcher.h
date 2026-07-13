@@ -111,48 +111,92 @@ struct OpenCvStereoConfig
 };
 
 /*
-	Parameters that are specific to the selected custom matching cost.
+	Parameters used only by the NCC matching cost.
+*/
+struct NccCostConfig
+{
+	/*
+		Size of the square NCC aggregation window.
+		Must be a positive odd number.
+	*/
+	int windowSize = 9;
 
-	These values affect only the disparity candidate evaluation. Shared pyramid,
-	consistency and post-processing settings are stored in CustomStereoConfig.
+	/*
+		Minimum accepted NCC score.
+		NCC is approximately in the range [-1, 1].
+		Higher values indicate a better match.
+	*/
+	float minCorrelation = 0.6f;
+};
+
+/*
+	Parameters used only by the SSD matching cost.
+*/
+struct SsdCostConfig
+{
+	/*
+		Size of the square SSD aggregation window.
+		Must be a positive odd number.
+	*/
+	int windowSize = 9;
+
+	/*
+		Maximum accepted normalized mean SSD cost.
+		The SSD implementation will later be changed so that image intensities
+		are treated in the range [0, 1]. The resulting mean squared cost is
+		therefore also approximately in the range [0, 1].
+	*/
+	float maxCost = 0.006f;
+
+	/*
+		Minimum relative separation between the best and second-best costs.
+		Larger values reject ambiguous matches more aggressively.
+	*/
+	float minUniqueness = 0.05f;
+};
+
+/*
+	Parameters used only by the Census matching cost.
+*/
+struct CensusCostConfig
+{
+	/*
+		Radius of the Census descriptor neighbourhood
+		radius = 1 -> 3x3 descriptor, 8 comparison bits
+		radius = 2 -> 5x5 descriptor, 24 comparison bits
+		The current descriptor uses 32 bits, so the radius must not exceed 2.
+	*/
+	int descriptorRadius = 2;
+
+	/*
+		Size of the square window used to aggregate normalized Hamming costs.
+		Must be a positive odd number.
+	*/
+	int aggregationWindowSize = 9;
+
+	/*
+		Maximum accepted normalized Census cost.
+		After normalization by the descriptor bit count, the cost is in [0, 1].
+	*/
+	float maxCost = 15.0f / 24.0f;
+
+	/*
+		Minimum relative separation between the best and second-best costs.
+	*/
+	float minUniqueness = 0.05f;
+};
+
+/*
+	Cost-function-specific configuration
+	Only the configuration associated with the selected metric is used.
 */
 struct CustomCostConfig
 {
-	/*
-		Cost metric used by the custom matcher.
-	*/
 	CustomCostMetric metric = CustomCostMetric::NCC;
 
-	/*
-		NCC confidence threshold.
-
-		NCC values range approximately from -1 to 1. A match is rejected when its
-		best correlation is below this value.
-	*/
-	float minNccCorrelation = 0.6f;
-
-	/*
-		Maximum accepted mean SSD cost.
-
-		SSD uses the average squared intensity difference over the matching
-		window. Lower values indicate better matches.
-	*/
-	float maxSsdCost = 400.0f;
-
-	/*
-		Census descriptor radius.
-
-		A radius of 2 produces a 5x5 Census neighbourhood with 24 comparison bits,
-		which fits inside the current 32-bit descriptor representation.
-	*/
-	int censusRadius = 2;
-
-	/*
-		Maximum accepted average Census Hamming cost.
-
-		Lower values indicate more similar Census descriptors.
-	*/
-	float maxCensusCost = 15.0f;
+	NccCostConfig ncc;
+	SsdCostConfig ssd;
+	CensusCostConfig census;
 };
 
 /*
@@ -180,13 +224,6 @@ struct CustomStereoConfig
 	double coarsestDownscale = 0.0625;
 
 	/*
-		Matching-cost aggregation window.
-
-		Must be a positive odd number.
-	*/
-	int windowSize = 9;
-
-	/*
 		Half-range of the residual disparity search at each refinement level.
 
 		For example, a value of 4 searches residual disparities from -4 to +4.
@@ -208,7 +245,7 @@ struct CustomStereoConfig
 
 	/*
 		Enables parabola-based subpixel refinement for cost functions that support
-		it. Currently used by NCC and SSD.
+		it.
 	*/
 	bool subpixel = true;
 

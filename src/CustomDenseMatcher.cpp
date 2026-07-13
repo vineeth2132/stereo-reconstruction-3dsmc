@@ -185,23 +185,34 @@ namespace
 
 	/*
 		Sweep the target image over all integer disparity hypotheses in [sLo, sHi]
-		and evaluate each candidate using mean squared difference over a local window.
+		and evaluate each candidate using normalized mean squared intensity difference over a local window.
 
 		For every pixel, the disparity with the minimum SSD cost is selected.
 		The neighbouring costs around the winner are retained for optional parabola-
 		based subpixel refinement. Matches whose minimum cost exceeds maxSsdCost,
 		or whose support window intersects the image border, are rejected.
 	*/
-	cv::Mat SsdSweep(const cv::Mat& reference, const cv::Mat& target, int sLo, int sHi, int windowSize, float maxSsdCost, bool subpixel, bool leftToRight)
+	cv::Mat SsdSweep(const cv::Mat& reference, const cv::Mat& target, int sLo, int sHi, int windowSize, float maxSsdCost, float minUniqueness, bool subpixel, bool leftToRight)
 	{
 		const int radius = windowSize / 2;
 		const cv::Size size = reference.size();
 
 		cv::Mat bestCost(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
 		cv::Mat bestD(size, CV_32F, cv::Scalar(kInvalidDisparity));
+		cv::Mat secondBestCost(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
 		cv::Mat costMinus(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
 		cv::Mat costPlus(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
 		cv::Mat previousCost(size, CV_32F, cv::Scalar(std::numeric_limits<float>::max()));
+
+		/*
+			Convert the summed squared intensity difference into a normalized
+			mean squared error.
+
+			Input intensities are currently in [0, 255], so division by
+			windowArea * 255^2 maps the SSD cost approximately into [0, 1].
+		*/
+		constexpr float kMaxIntensity = 255.0f;
+		const float normalization = static_cast<float>(windowSize * windowSize) * kMaxIntensity * kMaxIntensity;
 
 		for (int d = sLo; d <= sHi; ++d)
 		{
@@ -215,13 +226,18 @@ namespace
 			cv::multiply(difference, difference, squaredDifference);
 
 			cv::Mat cost = WindowSum(squaredDifference, windowSize);
-			cost /= static_cast<float>(windowSize * windowSize);
+
+			cost /= normalization;
 
 			cv::Mat previousWasBest;
 			cv::compare(bestD, static_cast<double>(d - 1), previousWasBest, cv::CMP_EQ);
 
 			cost.copyTo(costPlus, previousWasBest);
 
+			/*
+				Update the winning disparity and retain the neighbouring costs required
+				for the later parabolic subpixel refinement.
+			*/
 			cv::Mat better = cost < bestCost;
 
 			cost.copyTo(bestCost, better);
@@ -230,6 +246,51 @@ namespace
 			costPlus.setTo(std::numeric_limits<float>::max(), better);
 
 			cost.copyTo(previousCost);
+		}
+
+		/*
+			Find the best competing disparity while excluding the winner and its
+			immediate neighbours.
+
+			The disparities bestD - 1, bestD and bestD + 1 belong to the same local
+			cost minimum and are therefore not treated as independent alternatives.
+		*/
+		for (int d = sLo; d <= sHi; ++d)
+		{
+			const cv::Mat shiftedTarget = ShiftHorizontally(target, d, leftToRight);
+
+			cv::Mat difference;
+			cv::subtract(reference, shiftedTarget, difference);
+
+			cv::Mat squaredDifference;
+			cv::multiply(difference, difference, squaredDifference);
+
+			cv::Mat cost = WindowSum(squaredDifference, windowSize);
+
+			cost /= normalization;
+
+			/*
+				Only consider candidates farther than one disparity step from the
+				winning integer disparity.
+			*/
+			cv::Mat distanceFromWinner;
+			cv::absdiff(bestD, cv::Scalar(static_cast<float>(d)), distanceFromWinner);
+
+			cv::Mat outsideWinnerNeighbourhood = distanceFromWinner > 1.0f;
+
+			/*
+				Ignore pixels for which the first sweep did not find any valid winner.
+			*/
+			cv::Mat hasWinner = bestD > kInvalidDisparity;
+
+			cv::Mat validAlternative;
+			cv::bitwise_and(outsideWinnerNeighbourhood, hasWinner, validAlternative);
+
+			cv::Mat betterSecond = cost < secondBestCost;
+
+			cv::bitwise_and(betterSecond, validAlternative, betterSecond);
+
+			cost.copyTo(secondBestCost, betterSecond);
 		}
 
 		cv::Mat disparity = bestD.clone();
@@ -246,11 +307,16 @@ namespace
 
 				for (int col = 0; col < size.width; ++col)
 				{
+					if (dPtr[col] <= kInvalidDisparity)
+					{
+						continue;
+					}
+
 					const float m = mPtr[col];
 					const float c = cPtr[col];
 					const float p = pPtr[col];
 
-					if (!std::isfinite(m) || !std::isfinite(p))
+					if (!std::isfinite(m) || !std::isfinite(p) || !std::isfinite(c))
 						continue;
 
 					const float denominator = m - 2.0f * c + p;
@@ -272,7 +338,37 @@ namespace
 		disparity.colRange(std::max(0, size.width - radius), size.width).setTo(kInvalidDisparity);
 
 		cv::Mat weakMatches = bestCost > maxSsdCost;
-		disparity.setTo(kInvalidDisparity, weakMatches);
+
+		/*
+			Relative separation between the best and second-best costs.
+
+			uniqueness = 0:
+				best and second-best candidates are equally good.
+
+			Larger values:
+				the winner is more clearly separated from the alternatives.
+		*/
+		constexpr float kUniquenessEpsilon = 1e-6f;
+
+		cv::Mat uniqueness =
+			(secondBestCost - bestCost) /
+			(secondBestCost + kUniquenessEpsilon);
+
+		cv::Mat ambiguousMatches = uniqueness < minUniqueness;
+
+		/*
+			If secondBestCost is still infinite, there was no valid second candidate.
+			Do not reject such a pixel based on uniqueness alone.
+		*/
+		cv::Mat finiteSecondBest;
+		cv::compare(secondBestCost, std::numeric_limits<float>::max(), finiteSecondBest, cv::CMP_LT);
+
+		cv::bitwise_and(ambiguousMatches, finiteSecondBest, ambiguousMatches);
+
+		cv::Mat rejectedMatches;
+		cv::bitwise_or(weakMatches, ambiguousMatches, rejectedMatches);
+
+		disparity.setTo(kInvalidDisparity, rejectedMatches);
 
 		return disparity;
 	}
@@ -341,19 +437,23 @@ namespace
 		incomplete descriptor support, border overlap or a final cost above
 		maxCensusCost are rejected.
 	*/
-	cv::Mat CensusSweep(const cv::Mat& reference, const cv::Mat& target, int sLo, int sHi, int windowSize, int censusRadius, float maxCensusCost, bool leftToRight)
+	cv::Mat CensusSweep(const cv::Mat& reference, const cv::Mat& target, int sLo, int sHi, int windowSize, int censusRadius, 
+						float maxCensusCost, float minUniqueness, bool subpixel, bool leftToRight)
 	{
 		const cv::Size size = reference.size();
 		const int borderRadius = censusRadius + windowSize / 2;
+		const int descriptorBitCount = (2 * censusRadius + 1) * (2 * censusRadius + 1) - 1;
 		const float invalidCost = std::numeric_limits<float>::max();
 
 		const cv::Mat referenceCensus = ComputeCensusTransform(reference, censusRadius);
-
 		const cv::Mat targetCensus = ComputeCensusTransform(target, censusRadius);
 
 		cv::Mat bestCost(size, CV_32F, cv::Scalar(invalidCost));
-
+		cv::Mat secondBestCost(size, CV_32F, cv::Scalar(invalidCost));
 		cv::Mat bestD(size, CV_32F, cv::Scalar(kInvalidDisparity));
+		cv::Mat costMinus(size, CV_32F, cv::Scalar(invalidCost));
+		cv::Mat costPlus(size, CV_32F, cv::Scalar(invalidCost));
+		cv::Mat previousCost(size, CV_32F, cv::Scalar(invalidCost));
 
 		for (int d = sLo; d <= sHi; ++d)
 		{
@@ -383,7 +483,7 @@ namespace
 					const unsigned int referenceDescriptor = static_cast<unsigned int>(referenceRow[col]);
 					const unsigned int targetDescriptor = static_cast<unsigned int>(targetCensus.at<int>(row,targetCol));
 
-					costRow[col] = static_cast<float>(HammingDistance(referenceDescriptor,targetDescriptor));
+					costRow[col] = static_cast<float>(HammingDistance(referenceDescriptor, targetDescriptor)) / static_cast<float>(descriptorBitCount);
 					validRow[col] = 255;
 				}
 			}
@@ -401,23 +501,147 @@ namespace
 
 			aggregatedCost.setTo(invalidCost, incompleteWindow);
 
+			cv::Mat previousWasBest;
+			cv::compare(bestD, static_cast<double>(d - 1), previousWasBest, cv::CMP_EQ);
+			aggregatedCost.copyTo(costPlus, previousWasBest);
+
 			cv::Mat better = aggregatedCost < bestCost;
-
 			aggregatedCost.copyTo(bestCost, better);
-
 			bestD.setTo(static_cast<double>(d), better);
+			previousCost.copyTo(costMinus, better);
+			costPlus.setTo(invalidCost, better);
+
+			aggregatedCost.copyTo(previousCost);
+		}
+
+		if (minUniqueness > 0.0f)
+		{
+			for (int d = sLo; d <= sHi; ++d)
+			{
+				const int shift = leftToRight ? d : -d;
+
+				cv::Mat pixelCost(size, CV_32F, cv::Scalar(0.0f));
+				cv::Mat validDescriptorMask(size, CV_8U, cv::Scalar(0));
+
+				for (int row = censusRadius; row < size.height - censusRadius; ++row)
+				{
+					const int* referenceRow = referenceCensus.ptr<int>(row);
+					float* costRow = pixelCost.ptr<float>(row);
+					unsigned char* validRow = validDescriptorMask.ptr<unsigned char>(row);
+
+					for (int col = censusRadius; col < size.width - censusRadius; ++col)
+					{
+						const int targetCol = col - shift;
+
+						if (targetCol < censusRadius || targetCol >= size.width - censusRadius)
+						{
+							continue;
+						}
+
+						const unsigned int referenceDescriptor = static_cast<unsigned int>(referenceRow[col]);
+						const unsigned int targetDescriptor = static_cast<unsigned int>(targetCensus.at<int>(row, targetCol));
+
+						costRow[col] = static_cast<float>(HammingDistance(referenceDescriptor, targetDescriptor)) / static_cast<float>(descriptorBitCount);
+						validRow[col] = 255;
+					}
+				}
+
+				cv::Mat aggregatedCost = WindowSum(pixelCost, windowSize);
+				aggregatedCost /= static_cast<float>(windowSize * windowSize);
+
+				cv::Mat validMaskFloat;
+				validDescriptorMask.convertTo(validMaskFloat, CV_32F, 1.0 / 255.0);
+
+				cv::Mat validSupport = WindowSum(validMaskFloat, windowSize);
+				cv::Mat incompleteWindow = validSupport < static_cast<float>(windowSize * windowSize);
+				aggregatedCost.setTo(invalidCost, incompleteWindow);
+
+				cv::Mat distanceFromWinner;
+				cv::absdiff(bestD, cv::Scalar(static_cast<float>(d)), distanceFromWinner);
+
+				cv::Mat outsideWinnerNeighbourhood = distanceFromWinner > 1.0f;
+				cv::Mat hasWinner = bestD > kInvalidDisparity;
+
+				cv::Mat validAlternative;
+				cv::bitwise_and(outsideWinnerNeighbourhood, hasWinner, validAlternative);
+
+				cv::Mat betterSecond = aggregatedCost < secondBestCost;
+				cv::bitwise_and(betterSecond, validAlternative, betterSecond);
+
+				aggregatedCost.copyTo(secondBestCost, betterSecond);
+			}
+		}
+		cv::Mat disparity = bestD.clone();
+
+		if (subpixel)
+		{
+			for (int row = 0; row < size.height; ++row)
+			{
+				const float* dPtr = bestD.ptr<float>(row);
+				const float* cPtr = bestCost.ptr<float>(row);
+				const float* mPtr = costMinus.ptr<float>(row);
+				const float* pPtr = costPlus.ptr<float>(row);
+				float* outPtr = disparity.ptr<float>(row);
+
+				for (int col = 0; col < size.width; ++col)
+				{
+					if (dPtr[col] <= kInvalidDisparity)
+					{
+						continue;
+					}
+
+					const float m = mPtr[col];
+					const float c = cPtr[col];
+					const float p = pPtr[col];
+
+					if (!std::isfinite(m) || !std::isfinite(c) || !std::isfinite(p) ||
+						m == invalidCost || c == invalidCost || p == invalidCost)
+					{
+						continue;
+					}
+
+					const float denominator = m - 2.0f * c + p;
+
+					if (std::abs(denominator) < 1e-6f)
+					{
+						continue;
+					}
+
+					const float delta = 0.5f * (m - p) / denominator;
+
+					if (delta > -1.0f && delta < 1.0f)
+					{
+						outPtr[col] = dPtr[col] + delta;
+					}
+				}
+			}
 		}
 
 		cv::Mat weakMatches = bestCost > maxCensusCost;
+		cv::Mat rejectedMatches = weakMatches.clone();
 
-		bestD.setTo(kInvalidDisparity, weakMatches);
+		if (minUniqueness > 0.0f)
+		{
+			constexpr float kUniquenessEpsilon = 1e-6f;
 
-		bestD.rowRange(0, std::min(borderRadius, size.height)).setTo(kInvalidDisparity);
-		bestD.rowRange(std::max(0, size.height - borderRadius), size.height).setTo(kInvalidDisparity);
-		bestD.colRange(0, std::min(borderRadius, size.width)).setTo(kInvalidDisparity);
-		bestD.colRange(std::max(0, size.width - borderRadius), size.width).setTo(kInvalidDisparity);
+			cv::Mat uniqueness = (secondBestCost - bestCost) / (secondBestCost + kUniquenessEpsilon);
+			cv::Mat ambiguousMatches = uniqueness < minUniqueness;
 
-		return bestD;
+			cv::Mat finiteSecondBest;
+			cv::compare(secondBestCost, std::numeric_limits<float>::max(), finiteSecondBest, cv::CMP_LT);
+
+			cv::bitwise_and(ambiguousMatches, finiteSecondBest, ambiguousMatches);
+			cv::bitwise_or(rejectedMatches, ambiguousMatches, rejectedMatches);
+		}
+
+		disparity.setTo(kInvalidDisparity, rejectedMatches);
+
+		disparity.rowRange(0, std::min(borderRadius, size.height)).setTo(kInvalidDisparity);
+		disparity.rowRange(std::max(0, size.height - borderRadius), size.height).setTo(kInvalidDisparity);
+		disparity.colRange(0, std::min(borderRadius, size.width)).setTo(kInvalidDisparity);
+		disparity.colRange(std::max(0, size.width - borderRadius), size.width).setTo(kInvalidDisparity);
+
+		return disparity;
 	}
 
 	/*
@@ -437,8 +661,8 @@ namespace
 				target,
 				sLo,
 				sHi,
-				config.custom.windowSize,
-				config.customCost.minNccCorrelation,
+				config.customCost.ncc.windowSize,
+				config.customCost.ncc.minCorrelation,
 				config.custom.subpixel,
 				leftToRight);
 
@@ -448,8 +672,9 @@ namespace
 				target,
 				sLo,
 				sHi,
-				config.custom.windowSize,
-				config.customCost.maxSsdCost,
+				config.customCost.ssd.windowSize,
+				config.customCost.ssd.maxCost,
+				config.customCost.ssd.minUniqueness,
 				config.custom.subpixel,
 				leftToRight);
 
@@ -459,9 +684,11 @@ namespace
 				target,
 				sLo,
 				sHi,
-				config.custom.windowSize,
-				config.customCost.censusRadius,
-				config.customCost.maxCensusCost,
+				config.customCost.census.aggregationWindowSize,
+				config.customCost.census.descriptorRadius,
+				config.customCost.census.maxCost,
+				config.customCost.census.minUniqueness,
+				config.custom.subpixel,
 				leftToRight);
 		}
 
@@ -1089,9 +1316,26 @@ std::vector<cv::Mat> CustomDenseMatcher::BuildPyramid(const cv::Mat& fullFloat, 
 	return pyramid;
 }
 
+int GetMatchingWindowSize(const DenseStereoConfig& config)
+{
+	switch (config.customCost.metric)
+	{
+	case CustomCostMetric::NCC:
+		return config.customCost.ncc.windowSize;
+
+	case CustomCostMetric::SSD:
+		return config.customCost.ssd.windowSize;
+
+	case CustomCostMetric::Census:
+		return config.customCost.census.aggregationWindowSize;
+	}
+
+	throw std::runtime_error("Unknown custom cost metric.");
+}
+
 cv::Mat CustomDenseMatcher::MatchDirectionPyramid(const std::vector<cv::Mat>& referencePyramid, const std::vector<cv::Mat>& targetPyramid, const std::vector<double>& scales, const DenseStereoConfig& config, bool leftToRight) const
 {
-	const int windowSize = config.custom.windowSize;
+	const int windowSize = GetMatchingWindowSize(config);
 	const int radius = windowSize / 2;
 	const int residualRadius = config.custom.residualRadius;
 	const char* dirTag = leftToRight ? "L->R" : "R->L";
@@ -1182,7 +1426,51 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 
 	std::cout << "Custom hierarchical " << metricName << " disparity computation started." << std::endl;
 
-	if (config.custom.windowSize <= 0 || config.custom.windowSize % 2 == 0)
+	switch (config.customCost.metric)
+	{
+	case CustomCostMetric::NCC:
+		if (config.customCost.ncc.minCorrelation < -1.0f || config.customCost.ncc.minCorrelation > 1.0f)
+		{
+			throw std::runtime_error("NCC minCorrelation must be in [-1, 1].");
+		}
+		break;
+
+	case CustomCostMetric::SSD:
+		if (config.customCost.ssd.maxCost < 0.0f)
+		{
+			throw std::runtime_error("SSD maxCost must be non-negative.");
+		}
+
+		if (config.customCost.ssd.minUniqueness < 0.0f || config.customCost.ssd.minUniqueness > 1.0f)
+		{
+			throw std::runtime_error("SSD minUniqueness must be in [0, 1].");
+		}
+		break;
+
+	case CustomCostMetric::Census:
+		if (config.customCost.census.descriptorRadius < 1 || config.customCost.census.descriptorRadius > 2)
+		{
+			throw std::runtime_error("Census descriptorRadius must be 1 or 2 for the current 32-bit descriptor.");
+		}
+
+		if (config.customCost.census.maxCost < 0.0f)
+		{
+			throw std::runtime_error("Census maxCost must be non-negative.");
+		}
+
+		if (config.customCost.census.minUniqueness < 0.0f || config.customCost.census.minUniqueness > 1.0f)
+		{
+			throw std::runtime_error("Census minUniqueness must be in [0, 1].");
+		}
+		break;
+
+	default:
+		throw std::runtime_error("Unknown custom cost metric.");
+	}
+
+	const int windowSize = GetMatchingWindowSize(config);
+
+	if (windowSize <= 0 || windowSize % 2 == 0)
 	{
 		throw std::runtime_error("customWindowSize must be a positive odd number.");
 	}
@@ -1225,7 +1513,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 	std::cout << "Custom matcher pyramid: " << scales.size() << " levels, scales "
 		<< scales.front() << ".." << scales.back() << ", finest "
 		<< leftPyramid.back().cols << "x" << leftPyramid.back().rows
-		<< ", window " << config.custom.windowSize << std::endl;
+		<< ", window " << windowSize << std::endl;
 
 	// Left-reference pass (the disparity we keep).
 	cv::Mat disparityWork = MatchDirectionPyramid(leftPyramid, rightPyramid, scales, config, /*leftToRight=*/true);
@@ -1241,7 +1529,7 @@ DenseMatchingResult CustomDenseMatcher::ComputeDisparity(const RectificationResu
 		below overwrite the pixels they reject with codes 3 and 4; whatever survives
 		stays 0 (matched).
 	*/
-	const int reasonBorderRadius = config.custom.windowSize / 2;
+	const int reasonBorderRadius = windowSize / 2;
 	cv::Mat reasonWork(disparityWork.size(), CV_8U, cv::Scalar(CustomMatchReasonMatched));
 	cv::Mat invalidWork = disparityWork <= kInvalidDisparity;
 	reasonWork.setTo(CustomMatchReasonNeverMatched, invalidWork);
