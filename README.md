@@ -212,6 +212,7 @@ Running the executable writes the following step outputs to `out/`. The dense an
 | `disparity_<tag>_colored.png` | Colored disparity map (invalid pixels black) |
 | `disparity_<tag>_float.tiff`, `valid_disparity_<tag>_mask.tiff` | Raw disparity + mask (for quantitative inspection) |
 | `depth_<tag>_float.tiff`, `valid_depth_<tag>_mask.tiff` | Per-pixel depth (Z) + mask |
+| `depth_dust3r_float.tiff`, `valid_depth_dust3r_mask.tiff` | Metric DUSt3R depth map + valid mask |
 | `pointcloud_<tag>.ply` | Colored 3D point cloud |
 | `mesh_<tag>.ply` | Triangle mesh from the disparity grid |
 | `valid_matched_custom_mask.tiff` | Custom backend only: the pre-fill matched mask (honest, fill-free coverage; the ~36% of valid pixels that were genuinely matched vs. directionally filled) |
@@ -222,6 +223,7 @@ Running the executable writes the following step outputs to `out/`. The dense an
 | `comparison_disparity.png`, `comparison_depth.png` | Four-panel side-by-side (opencv \| custom dense, filled \| custom matched-only \| ground truth), shared color scale; panels degrade gracefully if the GT or matched mask is missing (from `visualize_maps.py`) |
 | `gt_depth_raw_float.tiff`, `gt_depth_rectified_float.tiff` | ETH3D ground-truth depth (raw + rectified into the disparity frame), written only when the GT data is present |
 | `error_<tag>_scaled.png` | Absolute depth-error map vs. rectified GT, shared color scale, white = invalid (from `evaluate_depth.py`) |
+| `error_dust3r_scaled.png` | DUSt3R absolute depth-error map vs. aligned rectified GT |
 
 The dense/3D outputs are only produced in their `<tag>`ged form; the earlier
 un-tagged `mesh.ply`, `pointcloud.ply`, and `disparity_*` names are no longer
@@ -239,6 +241,51 @@ helpers (color scale, invalid shown white) but renders both backends and the
 side-by-side comparison in one go.
 
 Open the `.ply` files in MeshLab or CloudCompare. `out/` is git-ignored.
+
+## DUSt3R depth estimation
+
+An optional DUSt3R-based depth backend is available through
+`scripts/run_dust3r_depth.py`. It runs the official two-view `PairViewer`
+workflow on `out/rectified_left.png` and `out/rectified_right.png`.
+
+DUSt3R predicts depth up to an unknown global scale. The script converts the
+prediction to metric depth by matching the predicted camera baseline to the
+physical ETH3D stereo baseline.
+
+DUSt3R must be cloned separately next to this repository:
+
+```text
+3d_project/
+├── stereo-reconstruction-3dsmc/
+└── dust3r/
+```
+
+Run it from the project root with the DUSt3R virtual environment active:
+
+```bash
+source .venv-dust3r/bin/activate
+
+python scripts/run_dust3r_depth.py \
+  --dust3r-root ../dust3r \
+  --baseline 0.4289
+```
+
+The script writes:
+
+```text
+out/depth_dust3r_float.tiff
+out/valid_depth_dust3r_mask.tiff
+```
+
+Evaluate it together with the other backends:
+
+```bash
+python scripts/evaluate_depth.py --tags opencv custom dust3r
+```
+
+DUSt3R uses a resized and center-cropped input resolution, so the evaluator
+applies the same alignment to the ground-truth depth before computing its
+metrics.
 
 ## Quantitative evaluation
 
