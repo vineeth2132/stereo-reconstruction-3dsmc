@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 #include <limits>
-#include <intrin.h>
+#include <bit>
 
 namespace
 {
@@ -316,7 +316,15 @@ namespace
 					const float c = cPtr[col];
 					const float p = pPtr[col];
 
-					if (!std::isfinite(m) || !std::isfinite(p) || !std::isfinite(c))
+					// The cost mats are seeded with FLT_MAX, which is finite, so the
+					// isfinite checks alone let a winner sitting on the sweep boundary
+					// (costMinus or costPlus never written) through and produce a
+					// spurious ~+-0.5 px parabola shift. Also reject the sentinel,
+					// mirroring the guard in CensusSweep.
+					const float invalidCost = std::numeric_limits<float>::max();
+
+					if (!std::isfinite(m) || !std::isfinite(p) || !std::isfinite(c) ||
+						m == invalidCost || c == invalidCost || p == invalidCost)
 						continue;
 
 					const float denominator = m - 2.0f * c + p;
@@ -418,11 +426,12 @@ namespace
 
 	/*
 		Return the Hamming distance between two Census descriptors by counting the
-		set bits in their XOR result.
+		set bits in their XOR result. std::popcount (C++20) is portable across
+		MSVC/GCC/Clang, unlike the MSVC-only __popcnt intrinsic.
 	*/
 	int HammingDistance(unsigned int a, unsigned int b)
 	{
-		return __popcnt(a ^ b);
+		return std::popcount(a ^ b);
 	}
 
 
