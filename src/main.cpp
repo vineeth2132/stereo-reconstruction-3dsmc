@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -12,13 +13,97 @@
 #include "DepthReconstructor.h"
 #include "DepthMapEvaluator.h"
 
-int main()
+/*
+	Strip a single trailing '/' or '\\' so the scene directory joins cleanly with
+	the ETH3D-relative sub-paths regardless of whether the caller supplied a
+	trailing slash.
+*/
+static std::filesystem::path NormalizeSceneDir(std::string sceneDir)
 {
-	const std::filesystem::path outputDir = "../out";
+	while (!sceneDir.empty() && (sceneDir.back() == '/' || sceneDir.back() == '\\'))
+	{
+		sceneDir.pop_back();
+	}
+	return std::filesystem::path(sceneDir);
+}
+
+int main(int argc, char** argv)
+{
+	/*
+		Scene-parameterizable entry point so the same binary can run on any ETH3D
+		DSLR scene (a TA requirement). Defaults reproduce the original hardcoded
+		delivery_area run exactly, so invoking with zero arguments is unchanged.
+
+		Usage: stereo_reconstruction [sceneDir] [leftImage] [rightImage] [outDir]
+		Accepted argument counts: 0 (all defaults), 1 (sceneDir), 3 (sceneDir +
+		pair), 4 (all). leftImage/rightImage are relative to sceneDir.
+	*/
+	const char* usage =
+		"Usage: stereo_reconstruction [sceneDir] [leftImage] [rightImage] [outDir]\n"
+		"  sceneDir    ETH3D scene root directory (default: ../data/delivery_area/)\n"
+		"  leftImage   left image path relative to sceneDir\n"
+		"              (default: images/dslr_images_undistorted/DSC_0688.jpg)\n"
+		"  rightImage  right image path relative to sceneDir\n"
+		"              (default: images/dslr_images_undistorted/DSC_0689.jpg)\n"
+		"  outDir      output directory (default: ../out)\n"
+		"Accepted argument counts: 0, 1 (sceneDir), 3 (sceneDir + pair), 4 (all).\n";
+
+	// Defaults match the original hardcoded delivery_area configuration.
+	std::string sceneDirArg = "../data/delivery_area/";
+	std::string leftImageRelative = "images/dslr_images_undistorted/DSC_0688.jpg";
+	std::string rightImageRelative = "images/dslr_images_undistorted/DSC_0689.jpg";
+	std::string outputDirArg = "../out";
+
+	// Collect positional arguments, honoring --help / -h anywhere on the line.
+	std::vector<std::string> positional;
+	for (int i = 1; i < argc; ++i)
+	{
+		const std::string arg = argv[i];
+		if (arg == "--help" || arg == "-h")
+		{
+			std::cout << usage;
+			return 0;
+		}
+		positional.push_back(arg);
+	}
+
+	switch (positional.size())
+	{
+	case 0:
+		break;
+	case 1:
+		sceneDirArg = positional[0];
+		break;
+	case 3:
+		sceneDirArg = positional[0];
+		leftImageRelative = positional[1];
+		rightImageRelative = positional[2];
+		break;
+	case 4:
+		sceneDirArg = positional[0];
+		leftImageRelative = positional[1];
+		rightImageRelative = positional[2];
+		outputDirArg = positional[3];
+		break;
+	default:
+		std::cerr << "Error: unexpected number of arguments (" << positional.size() << ").\n" << usage;
+		return 1;
+	}
+
+	const std::filesystem::path sceneDir = NormalizeSceneDir(sceneDirArg);
+	const std::filesystem::path outputDir = outputDirArg;
+
+	// Echo the resolved configuration so run logs are self-documenting.
+	std::cout << "Resolved configuration:" << std::endl;
+	std::cout << "  Scene dir  : " << sceneDir.string() << std::endl;
+	std::cout << "  Left image : " << leftImageRelative << std::endl;
+	std::cout << "  Right image: " << rightImageRelative << std::endl;
+	std::cout << "  Output dir : " << outputDir.string() << std::endl;
+
 	std::filesystem::create_directories(outputDir);
 
-	DataLoader dataLoader("../data/delivery_area/");
-	StereoImagePair imagePair = dataLoader.LoadStereoPair("images/dslr_images_undistorted/DSC_0688.jpg", "images/dslr_images_undistorted/DSC_0689.jpg");
+	DataLoader dataLoader(sceneDir);
+	StereoImagePair imagePair = dataLoader.LoadStereoPair(leftImageRelative, rightImageRelative);
 	//imagePair.ShowResized(0.15);
 
 	const CameraIntrinsics camIntrinsics = dataLoader.LoadCameraIntrinsics("dslr_calibration_undistorted/cameras.txt");
