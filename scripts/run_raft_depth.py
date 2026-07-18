@@ -97,8 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fx",
         type=float,
-        default=DEFAULT_FX_PIXELS,
-        help="Original horizontal focal length in pixels.",
+        default=None,
+        help=(
+            "Rectified-frame horizontal focal length in pixels. If omitted, "
+            "the value is read from out/rectified_meta.txt (written by the "
+            f"C++ pipeline), falling back to {DEFAULT_FX_PIXELS}."
+        ),
     )
 
     parser.add_argument(
@@ -129,6 +133,32 @@ def parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+def resolve_fx(args: argparse.Namespace) -> None:
+    """Resolve the rectified-frame fx: explicit --fx wins, then the
+    rectified_meta.txt written by the C++ pipeline, then the historical
+    default. The rectified fx differs from the raw cameras.txt fx and
+    changes per scene/pair, so the meta file is the reliable source."""
+
+    if args.fx is not None:
+        return
+
+    meta_path = args.out / "rectified_meta.txt"
+    if meta_path.exists():
+        for line in meta_path.read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "fx":
+                args.fx = float(parts[1])
+                print(f"Using rectified fx from {meta_path.name}: {args.fx:.4f} px")
+                return
+
+    args.fx = DEFAULT_FX_PIXELS
+    print(
+        f"Warning: {meta_path.name} not found; falling back to the "
+        f"delivery_area default fx = {DEFAULT_FX_PIXELS} px (raw-frame value; "
+        "metric depth may carry a global scale bias)."
+    )
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
@@ -232,6 +262,7 @@ def find_generated_npy(demo_output: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
+    resolve_fx(args)
     validate_arguments(args)
 
     raft_root = args.raft_root.resolve()

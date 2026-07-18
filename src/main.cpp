@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -153,6 +154,20 @@ int main(int argc, char** argv)
 	*/
 	float metricBaseline = dataLoader.LoadMetricBaselineFromImagesTxt("dslr_calibration_undistorted/images.txt", imagePair.leftImgPath.filename().string(), imagePair.rightImgPath.filename().string());
 	std::cout << "Calculated Metric Baseline = " << metricBaseline << std::endl;
+
+	/*
+		Rectified-frame metadata for the Python deep-stereo wrappers. The
+		rectification synthesizes a new projection matrix, so its focal length
+		differs from the raw cameras.txt fx; RAFT's disparity-to-depth conversion
+		needs the rectified value (and it changes per scene/pair).
+	*/
+	{
+		std::ofstream metaFile(outputDir / "rectified_meta.txt");
+		metaFile << "fx " << rectResult.leftProjectionMatrix(0, 0) << "\n";
+		metaFile << "baseline " << metricBaseline << "\n";
+		metaFile << "width " << rectResult.rectifiedLeftImage.cols << "\n";
+		metaFile << "height " << rectResult.rectifiedLeftImage.rows << "\n";
+	}
 
 	/*
 		Ground-truth depth (ETH3D) for evaluation, done once independent of the
