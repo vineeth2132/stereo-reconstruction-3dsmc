@@ -108,8 +108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline",
         type=float,
-        default=DEFAULT_BASELINE_METERS,
-        help="Physical stereo baseline in meters.",
+        default=None,
+        help=(
+            "Physical stereo baseline in meters. If omitted, read from "
+            "out/rectified_meta.txt (written by the C++ pipeline), falling "
+            f"back to {DEFAULT_BASELINE_METERS}."
+        ),
     )
 
     parser.add_argument(
@@ -135,30 +139,54 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_fx(args: argparse.Namespace) -> None:
-    """Resolve the rectified-frame fx: explicit --fx wins, then the
-    rectified_meta.txt written by the C++ pipeline, then the historical
-    default. The rectified fx differs from the raw cameras.txt fx and
-    changes per scene/pair, so the meta file is the reliable source."""
+def read_rectified_meta(out_dir: Path) -> dict[str, float]:
+    """Parse out/rectified_meta.txt (written by the C++ pipeline):
+    'key value' per line, e.g. fx / baseline / width / height."""
 
-    if args.fx is not None:
-        return
-
-    meta_path = args.out / "rectified_meta.txt"
+    meta_path = out_dir / "rectified_meta.txt"
+    meta: dict[str, float] = {}
     if meta_path.exists():
         for line in meta_path.read_text().splitlines():
             parts = line.split()
-            if len(parts) == 2 and parts[0] == "fx":
-                args.fx = float(parts[1])
-                print(f"Using rectified fx from {meta_path.name}: {args.fx:.4f} px")
-                return
+            if len(parts) == 2:
+                try:
+                    meta[parts[0]] = float(parts[1])
+                except ValueError:
+                    pass
+    return meta
 
-    args.fx = DEFAULT_FX_PIXELS
-    print(
-        f"Warning: {meta_path.name} not found; falling back to the "
-        f"delivery_area default fx = {DEFAULT_FX_PIXELS} px (raw-frame value; "
-        "metric depth may carry a global scale bias)."
-    )
+
+def resolve_camera_parameters(args: argparse.Namespace) -> None:
+    """Resolve fx and baseline: explicit flags win, then the
+    rectified_meta.txt written by the C++ pipeline, then the historical
+    delivery_area defaults. The rectified fx differs from the raw
+    cameras.txt fx, and both fx and baseline change per scene/pair, so
+    the meta file is the reliable source."""
+
+    meta = read_rectified_meta(args.out)
+
+    if args.fx is None:
+        if "fx" in meta:
+            args.fx = meta["fx"]
+            print(f"Using rectified fx from rectified_meta.txt: {args.fx:.4f} px")
+        else:
+            args.fx = DEFAULT_FX_PIXELS
+            print(
+                "Warning: rectified_meta.txt not found; falling back to the "
+                f"delivery_area default fx = {DEFAULT_FX_PIXELS} px (raw-frame "
+                "value; metric depth may carry a global scale bias)."
+            )
+
+    if args.baseline is None:
+        if "baseline" in meta:
+            args.baseline = meta["baseline"]
+            print(f"Using baseline from rectified_meta.txt: {args.baseline:.6f} m")
+        else:
+            args.baseline = DEFAULT_BASELINE_METERS
+            print(
+                "Warning: rectified_meta.txt not found; falling back to the "
+                f"delivery_area default baseline = {DEFAULT_BASELINE_METERS} m."
+            )
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
@@ -262,7 +290,7 @@ def find_generated_npy(demo_output: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
-    resolve_fx(args)
+    resolve_camera_parameters(args)
     validate_arguments(args)
 
     raft_root = args.raft_root.resolve()

@@ -35,8 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline",
         type=float,
-        default=DEFAULT_BASELINE_METERS,
-        help="Physical stereo baseline in meters.",
+        default=None,
+        help=(
+            "Physical stereo baseline in meters. If omitted, read from "
+            "out/rectified_meta.txt (written by the C++ pipeline), falling "
+            f"back to {DEFAULT_BASELINE_METERS}."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -72,6 +76,24 @@ def main() -> None:
     for path in (dust3r_root, left_path, right_path):
         if not path.exists():
             raise SystemExit(f"Required path not found: {path}")
+
+    if args.baseline is None:
+        # The baseline changes per scene/pair, so prefer the value the C++
+        # pipeline recorded next to the rectified images.
+        meta_path = out_dir / "rectified_meta.txt"
+        if meta_path.exists():
+            for line in meta_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "baseline":
+                    args.baseline = float(parts[1])
+                    print(f"Using baseline from rectified_meta.txt: {args.baseline:.6f} m")
+                    break
+        if args.baseline is None:
+            args.baseline = DEFAULT_BASELINE_METERS
+            print(
+                "Warning: rectified_meta.txt not found; falling back to the "
+                f"delivery_area default baseline = {DEFAULT_BASELINE_METERS} m."
+            )
 
     if args.baseline <= 0:
         raise SystemExit("--baseline must be positive")
