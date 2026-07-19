@@ -1,8 +1,15 @@
 #include "SparseFeatureMatcher.h"
 
-SparseFeatureMatcher::SparseFeatureMatcher() 
+SparseFeatureMatcher::SparseFeatureMatcher()
 {
-	siftDetector = cv::SIFT::create();
+	/*
+		Cap the keypoint count (strongest-response first). cv::BFMatcher packs
+		the train index into 18 bits, so more than 262,144 descriptors per
+		image trips an assertion (the 25 MP playground scene produces ~400k
+		uncapped), and brute-force matching cost grows quadratically anyway.
+		200k keeps a safety margin below the limit.
+	*/
+	siftDetector = cv::SIFT::create(200000);
 };
 
 StereoFeatureSet SparseFeatureMatcher::DetectFeatures(const StereoImagePair& imagePair) const
