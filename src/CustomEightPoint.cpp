@@ -99,8 +99,14 @@ cv::Mat CustomEightPoint::EstimateFundamental(
         A.at<double>(i, 8) = 1.0;
     }
 
+    /*
+        Only vt (the 9 right singular vectors) is needed for the null-space
+        solution; FULL_UV would additionally build the N x N left singular
+        matrix, which is O(N^2) memory / O(N^3) time when N is the full inlier
+        set (~23k matches on facade froze the pipeline for ~an hour here).
+    */
     cv::Mat w, u, vt;
-    cv::SVD::compute(A, w, u, vt, cv::SVD::MODIFY_A | cv::SVD::FULL_UV);
+    cv::SVD::compute(A, w, u, vt, cv::SVD::MODIFY_A);
 
     cv::Mat f = vt.row(8).reshape(0, 3);
 
