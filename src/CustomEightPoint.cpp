@@ -104,9 +104,14 @@ cv::Mat CustomEightPoint::EstimateFundamental(
         solution; FULL_UV would additionally build the N x N left singular
         matrix, which is O(N^2) memory / O(N^3) time when N is the full inlier
         set (~23k matches on facade froze the pipeline for ~an hour here).
+        The thin SVD only returns min(N, 9) rows in vt, so the minimal 8-row
+        system still needs FULL_UV to expose the 9th (null-space) vector —
+        there it is an 8x8 u, which costs nothing.
     */
     cv::Mat w, u, vt;
-    cv::SVD::compute(A, w, u, vt, cv::SVD::MODIFY_A);
+    const int svdFlags =
+        cv::SVD::MODIFY_A | (A.rows < 9 ? cv::SVD::FULL_UV : 0);
+    cv::SVD::compute(A, w, u, vt, svdFlags);
 
     cv::Mat f = vt.row(8).reshape(0, 3);
 
