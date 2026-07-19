@@ -441,31 +441,31 @@ Takeaways:
 * Classical coverage tops out around ~93% because the left/right image bands
   are never seen by the second camera; no fill can recover them.
 
-### Results — `facade` (DSC_0336/0337, baseline 0.7839 m, GT-valid 4,790,076 px)
+### Results — `facade` (DSC_0336/0337, baseline 0.7839 m, GT-valid 4,790,669 px)
 
 | Method (stage) | native res | coverage | MAE (m) | median AE (m) | bad > 2 px |
 |---|---|---:|---:|---:|---:|
-| OpenCV SGBM+WLS (final) | 6204×4132 | 73.5% | **0.0545** | 0.0398 | **3.5%** |
-| NCC raw | 6204×4132 | 46.7% | 0.0923 | 0.0518 | 7.9% |
-| NCC filtered | 6204×4132 | 45.4% | 0.0754 | 0.0494 | 6.3% |
-| NCC filled | 6204×4132 | 82.9% | 0.2675 | 0.0652 | 21.4% |
-| SSD raw | 6204×4132 | 48.1% | 0.0954 | 0.0526 | 9.9% |
-| SSD filtered | 6204×4132 | 46.9% | 0.0776 | 0.0503 | 8.4% |
-| SSD filled | 6204×4132 | 87.6% | 0.3279 | 0.0670 | 23.1% |
-| Census raw | 6204×4132 | 57.6% | 0.0667 | 0.0465 | 6.4% |
-| Census filtered | 6204×4132 | 56.9% | 0.0603 | 0.0458 | 5.8% |
-| Census filled | 6204×4132 | 84.0% | 0.2370 | 0.0575 | 18.7% |
-| DUSt3R | 512×336 | 98.1% | 0.9576 | 0.9110 | — |
-| RAFT-Stereo | 640×416 | **100.0%** | 0.1613 | 0.0800 | 26.7% |
+| OpenCV SGBM+WLS (final) | 6204×4132 | 73.6% | **0.0552** | 0.0404 | **3.5%** |
+| NCC raw | 6204×4132 | 46.8% | 0.0910 | 0.0522 | 7.9% |
+| NCC filtered | 6204×4132 | 45.6% | 0.0754 | 0.0499 | 6.4% |
+| NCC filled | 6204×4132 | 82.7% | 0.2528 | 0.0651 | 21.1% |
+| SSD raw | 6204×4132 | 48.2% | 0.0944 | 0.0529 | 9.9% |
+| SSD filtered | 6204×4132 | 47.0% | 0.0767 | 0.0507 | 8.4% |
+| SSD filled | 6204×4132 | 87.5% | 0.3176 | 0.0668 | 22.9% |
+| Census raw | 6204×4132 | 57.2% | 0.0667 | 0.0470 | 6.4% |
+| Census filtered | 6204×4132 | 56.6% | 0.0605 | 0.0464 | 5.8% |
+| Census filled | 6204×4132 | 84.1% | 0.2528 | 0.0579 | 19.2% |
+| DUSt3R | 512×336 | 98.1% | 0.9545 | 0.9080 | — |
+| RAFT-Stereo | 640×416 | **100.0%** | 0.1613 | 0.0804 | 26.8% |
 
 The second scene changes the picture in instructive ways:
 
-* **SSD recovers completely** (48.1% raw coverage vs 11.2% on `delivery_area`):
+* **SSD recovers completely** (48.2% raw coverage vs 11.2% on `delivery_area`):
   the facade pair is texture-rich with consistent exposure, so SSD's missing
   photometric normalization no longer hurts. Its `delivery_area` collapse is an
   illumination problem, not an implementation problem — exactly the tradeoff
   the cost-metric comparison is meant to expose.
-* **Tuned OpenCV SGBM+WLS leads on this scene** (73.5% / 0.0545 m) — semi-global
+* **Tuned OpenCV SGBM+WLS leads on this scene** (73.6% / 0.0552 m) — semi-global
   optimization thrives on the repetitive but high-texture facade, while our
   local matcher family stays purely local. Census remains the best custom cost.
 * **DUSt3R degrades sharply** (median AE 0.91 m, residual scale 0.95): its
@@ -476,6 +476,39 @@ The second scene changes the picture in instructive ways:
 * Absolute errors are larger for everyone than on `delivery_area` — depth error
   grows quadratically with distance at fixed disparity precision, and this
   scene's median depth is ~18 m vs ~7 m.
+
+### Results — `playground` (DSC_0568/0569, baseline 0.3195 m, GT-valid 1,516,830 px)
+
+| Method (stage) | native res | coverage | MAE (m) | median AE (m) | bad > 2 px |
+|---|---|---:|---:|---:|---:|
+| OpenCV SGBM+WLS (final) | 6215×4141 | 35.1% | 0.0155 | 0.0026 | 13.7% |
+| NCC filtered | 6215×4141 | 12.3% | 0.0075 | 0.0022 | 13.1% |
+| SSD filtered | 6215×4141 | 3.4% | 0.0201 | 0.0050 | 24.1% |
+| Census filtered | 6215×4141 | 31.3% | **0.0059** | **0.0014** | **10.9%** |
+| NCC / SSD / Census filled | 69.7 / 53.1 / 74.7% | 0.31 / 0.70 / 0.34 | 0.02 / 0.13 / 0.01 | 64 / 83 / 50% |
+| DUSt3R | 512×336 | 97.7% | 0.2996 | 0.1150 | — |
+| RAFT-Stereo | 640×416 | **100.0%** | 0.1210 | 0.0104 | 57.6% |
+
+The third scene contributes a third failure mode — **coverage collapse**:
+
+* Thin metal structures and vegetation break window-based matching: even
+  Census keeps only 31.3% fill-free coverage (NCC 12.3%, SSD 3.4%). The pixels
+  that *do* survive the gates are extremely accurate (Census median AE 1.4 mm
+  at ~3.3 m median depth) — the gates correctly reject what they cannot match.
+* Filling from such sparse anchors is expensive: the filled stages reach
+  only 53–75% coverage at visibly degraded quality (bad>2px 50–83%) —
+  reinforcing the anchor-density lesson from `delivery_area`.
+* The deep methods stay dense where classical coverage collapses: RAFT 100% at
+  0.121 m MAE (median 0.010 m; its large RMSE comes from thin-structure
+  outliers). DUSt3R's residual scale is again ~4.5% off (0.955) — its
+  baseline-derived metric scale is fragile on every scene.
+* Cross-scene caution for the report: absolute MAE is not comparable across
+  scenes without accounting for depth (error ∝ depth² at fixed disparity
+  precision; median depth here is ~3.3 m vs ~7 m / ~18 m) — the disparity
+  bad-px columns are the depth-independent comparison.
+
+*(Note: the `facade` and `playground` runs use the 200k SIFT keypoint cap
+introduced for the BFMatcher index limit; `delivery_area` sits below the cap.)*
 
 ## Dense matching backends
 
