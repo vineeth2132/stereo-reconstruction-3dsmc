@@ -371,6 +371,56 @@ DUSt3R's native resolution (512×336 for our 3:2 pairs: long edge scaled to 512,
 center-cropped vertically). The evaluator inverts exactly that resize+crop when
 mapping the prediction back onto the full-resolution ground truth.
 
+## Qualitative Results
+
+This section presents sample qualitative results for three ETH3D scenes: **delivery_area**, **facade**, and **playground**. For each scene, we show disparity and depth comparisons together with filtered and filled Census mesh outputs.
+
+### Delivery Area
+
+#### Disparity Comparison
+
+<img src="results/delivery_area/comparison_disparity_filled.png" width="900">
+
+#### Depth Comparison
+
+<img src="results/delivery_area/comparison_paradigms_depth.png" width="900">
+
+#### Census Mesh Outputs
+
+<img src="results/delivery_area/census_filtered_mesh.png" width="440">
+<img src="results/delivery_area/census_filled_mesh.png" width="440">
+
+### Facade
+
+#### Disparity Comparison
+
+<img src="results/facade/comparison_disparity_filled.png" width="900">
+
+#### Depth Comparison
+
+<img src="results/facade/comparison_paradigms_depth.png" width="900">
+
+#### Census Mesh Outputs
+
+<img src="results/facade/census_filtered_mesh.png" width="440">
+<img src="results/facade/census_filled_mesh.png" width="440">
+
+### Playground
+
+#### Disparity Comparison
+
+<img src="results/playground/comparison_disparity_filled.png" width="900">
+
+#### Depth Comparison
+
+<img src="results/playground/comparison_paradigms_depth.png" width="900">
+
+#### Census Mesh Outputs
+
+<img src="results/playground/census_filtered_mesh.png" width="440">
+<img src="results/playground/census_filled_mesh.png" width="440">
+
+
 ## Quantitative evaluation
 
 `scripts/evaluate_depth.py` scores every method against the rectified ETH3D
