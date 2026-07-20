@@ -1,5 +1,8 @@
 # Stereo Reconstruction
 
+**GitHub Repository:**  
+https://github.com/vineeth2132/stereo-reconstruction-3dsmc
+
 A C++ stereo reconstruction pipeline implemented with OpenCV and Eigen, compared
 against two pretrained deep methods (RAFT-Stereo, DUSt3R) on ETH3D scenes.
 
